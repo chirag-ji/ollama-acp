@@ -100,10 +100,28 @@ const TOOLS: OllamaTool[] = [
     }
 ];
 
-function textFromPrompt(prompt: acp.PromptRequest["prompt"]): string {
+export function textFromPrompt(prompt: acp.PromptRequest["prompt"]): string {
     return prompt
-        .filter((p: any) => p.type === "text")
-        .map((p: any) => p.text)
+        .map((p: any) => {
+            if (p.type === "text") {
+                return p.text;
+            }
+            if (p.type === "resource") {
+                const res = p.resource;
+                if (res && typeof res === "object") {
+                    const uri = res.uri ?? "";
+                    const text = res.text ?? "";
+                    return `[File: ${uri}]\n${text}`;
+                }
+            }
+            if (p.type === "resource_link") {
+                const uri = p.uri ?? "";
+                const name = p.name ?? "";
+                return `[File: ${name} (${uri})]`;
+            }
+            return "";
+        })
+        .filter(Boolean)
         .join("\n");
 }
 
@@ -122,15 +140,6 @@ function modeState(mode: Mode): any {
                 description: "Read-only planning mode. The agent can inspect the workspace and propose changes without modifying files."
             }
         ]
-    };
-}
-
-function modelState(modelNames: string[]): any {
-    const current = ollama.getModel();
-    const names = Array.from(new Set([current, ...modelNames]));
-    return {
-        currentModelId: current,
-        availableModels: names.map(name => ({modelId: name, name, description: `Local Ollama model: ${name}`}))
     };
 }
 
@@ -380,7 +389,6 @@ app.onRequest("session/new", async (ctx: any) => {
     return {
         sessionId: id,
         modes: modeState(session.mode),
-        models: modelState(models),
         configOptions: configOptions(models)
     };
 });
