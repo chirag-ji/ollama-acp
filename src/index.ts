@@ -358,32 +358,30 @@ function configOptions(models: string[] = []): any[] {
     const allModels = Array.from(new Set([currentModel, ...models]));
     return [
         {
-            id: "ollama_url",
-            type: "select",
-            name: "Ollama URL",
-            description: "Base URL of the Ollama server",
-            category: "_provider",
-            currentValue: ollama.getBaseUrl(),
-            options: [
-                {value: "http://10.0.0.10:11434", name: "10.0.0.10:11434"},
-                {value: ollama.getBaseUrl(), name: ollama.getBaseUrl()}
-            ]
-        },
-        {
             id: "ollama_model",
             type: "select",
             name: "Ollama Model",
             description: "Model to use for chat completions",
-            category: "_provider",
+            category: "model",
             currentValue: currentModel,
             options: allModels.map(m => ({value: m, name: m}))
+        },
+        {
+            id: "ollama_url",
+            type: "select",
+            name: "Ollama URL",
+            description: "Base URL of the Ollama server",
+            currentValue: ollama.getBaseUrl(),
+            options: [
+                {value: ollama.getBaseUrl(), name: ollama.getBaseUrl()}
+            ]
         },
         {
             id: "ollama_thinking",
             type: "select",
             name: "Thinking / Reasoning",
             description: "Enable reasoning tokens (think mode). Disable for models that do not support thinking (e.g. qwen-coder2.5).",
-            category: "_provider",
+            category: "thought_level",
             currentValue: ollama.isThinking() ? "true" : "false",
             options: [
                 {value: "true", name: "Enabled"},
