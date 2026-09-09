@@ -22,7 +22,7 @@ function log(...args: unknown[]): void {
     }
 }
 
-function loadConfig(): { model?: string; baseUrl?: string } {
+function loadConfig(): { model?: string; baseUrl?: string; thinking?: boolean } {
     try {
         if (existsSync(CONFIG_FILE)) {
             return JSON.parse(readFileSync(CONFIG_FILE, "utf-8"));
@@ -32,7 +32,7 @@ function loadConfig(): { model?: string; baseUrl?: string } {
     return {};
 }
 
-function saveConfig(config: { model?: string; baseUrl?: string }): void {
+function saveConfig(config: { model?: string; baseUrl?: string; thinking?: boolean }): void {
     try {
         if (!existsSync(CONFIG_DIR)) {
             mkdirSync(CONFIG_DIR, {recursive: true});
@@ -43,7 +43,7 @@ function saveConfig(config: { model?: string; baseUrl?: string }): void {
 }
 
 const savedConfig = loadConfig();
-const ollama = new OllamaClient(savedConfig.baseUrl, savedConfig.model);
+const ollama = new OllamaClient(savedConfig.baseUrl, savedConfig.model, savedConfig.thinking);
 
 type Mode = "agent" | "plan";
 
@@ -270,6 +270,12 @@ async function runAgentTurn(session: Session, client: acp.AgentContext, userText
         const response = await ollama.chat(session.messages, TOOLS);
         const assistant = response.message;
         log("ollama response", session.id, "step:", step + 1, "tool_calls:", assistant.tool_calls?.length ?? 0, "content:", (assistant.content ?? "").slice(0, 200));
+        if (assistant.thinking) {
+            await emitUpdate(client, session.id, {
+                sessionUpdate: "agent_thought_chunk",
+                content: {type: "text", text: assistant.thinking}
+            });
+        }
         session.messages.push({
             role: "assistant",
             content: assistant.content,
@@ -371,6 +377,18 @@ function configOptions(models: string[] = []): any[] {
             category: "_provider",
             currentValue: currentModel,
             options: allModels.map(m => ({value: m, name: m}))
+        },
+        {
+            id: "ollama_thinking",
+            type: "select",
+            name: "Thinking / Reasoning",
+            description: "Enable reasoning tokens (think mode). Disable for models that do not support thinking (e.g. qwen-coder2.5).",
+            category: "_provider",
+            currentValue: ollama.isThinking() ? "true" : "false",
+            options: [
+                {value: "true", name: "Enabled"},
+                {value: "false", name: "Disabled"}
+            ]
         }
     ];
 }
@@ -398,11 +416,16 @@ app.onRequest("session/set_config_option", async (ctx: any) => {
     if (!session) throw acp.RequestError.invalidParams(undefined, "Unknown session");
     if (ctx.params.configId === "ollama_url" && typeof ctx.params.value === "string") {
         ollama.setBaseUrl(ctx.params.value);
-        saveConfig({model: ollama.getModel(), baseUrl: ctx.params.value});
+        saveConfig({model: ollama.getModel(), baseUrl: ctx.params.value, thinking: ollama.isThinking()});
     }
     if (ctx.params.configId === "ollama_model" && typeof ctx.params.value === "string") {
         ollama.setModel(ctx.params.value);
-        saveConfig({model: ctx.params.value, baseUrl: ollama.getBaseUrl()});
+        saveConfig({model: ctx.params.value, baseUrl: ollama.getBaseUrl(), thinking: ollama.isThinking()});
+    }
+    if (ctx.params.configId === "ollama_thinking" && typeof ctx.params.value === "string") {
+        const thinking = ctx.params.value === "true";
+        ollama.setThinking(thinking);
+        saveConfig({model: ollama.getModel(), baseUrl: ollama.getBaseUrl(), thinking});
     }
     const models = await ollama.listModels().catch(() => []);
     return {configOptions: configOptions(models)};
