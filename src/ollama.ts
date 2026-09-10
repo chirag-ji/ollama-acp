@@ -1,7 +1,9 @@
+export type OllamaToolCall = { function: { name: string; arguments: Record<string, unknown> } };
+
 export type OllamaMessage = {
   role: "system" | "user" | "assistant" | "tool";
   content?: string;
-  tool_calls?: Array<{ function: { name: string; arguments: Record<string, unknown> } }>;
+  tool_calls?: OllamaToolCall[];
   tool_name?: string;
 };
 
@@ -14,12 +16,23 @@ export type OllamaTool = {
   };
 };
 
+export type OllamaChunk = {
+  message?: {
+    role?: string;
+    content?: string;
+    thinking?: string;
+    tool_calls?: OllamaToolCall[];
+  };
+  done?: boolean;
+  done_reason?: string;
+};
+
 export type OllamaResponse = {
   message: {
     role: "assistant";
     content: string;
     thinking?: string;
-    tool_calls?: Array<{ function: { name: string; arguments: Record<string, unknown> } }>;
+    tool_calls?: OllamaToolCall[];
   };
   done: boolean;
 };
@@ -138,36 +151,99 @@ export class OllamaClient {
     return names;
   }
 
-  async chat(messages: OllamaMessage[], tools: OllamaTool[]): Promise<OllamaResponse> {
-    let res = await fetch(`${this.baseUrl}/api/chat`, {
+  private async postChat(messages: OllamaMessage[], tools: OllamaTool[], think: boolean, signal?: AbortSignal): Promise<Response> {
+    return fetch(`${this.baseUrl}/api/chat`, {
       method: "POST",
       headers: this.headers(),
       body: JSON.stringify({
         model: this.model,
         messages,
         tools,
-        stream: false,
-        think: this.thinking,
+        stream: true,
+        think,
         options: {num_ctx: this.numCtx}
-      })
+      }),
+      signal
     });
+  }
+
+  private async readChatStream(
+    res: Response,
+    onChunk?: (chunk: OllamaChunk) => void | Promise<void>,
+    signal?: AbortSignal
+  ): Promise<OllamaResponse> {
+    if (!res.body) throw new Error("Ollama /api/chat returned no body");
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let content = "";
+    let thinking = "";
+    let toolCalls: OllamaToolCall[] = [];
+
+    const processLine = async (line: string): Promise<void> => {
+      const trimmed = line.trim();
+      if (!trimmed) return;
+      let chunk: OllamaChunk;
+      try {
+        chunk = JSON.parse(trimmed);
+      } catch {
+        return;
+      }
+      if (chunk.message?.content) content += chunk.message.content;
+      if (chunk.message?.thinking) thinking += chunk.message.thinking;
+      if (chunk.message?.tool_calls?.length) toolCalls = chunk.message.tool_calls;
+      if (onChunk) {
+        try {
+          await onChunk(chunk);
+        } catch (err) {
+          log("onChunk error:", err);
+        }
+      }
+    };
+
+    while (true) {
+      if (signal?.aborted) {
+        await reader.cancel().catch(() => undefined);
+        const err = new Error("Aborted");
+        err.name = "AbortError";
+        throw err;
+      }
+      const {done, value} = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, {stream: true});
+      let nl = buffer.indexOf("\n");
+      while (nl !== -1) {
+        const line = buffer.slice(0, nl);
+        buffer = buffer.slice(nl + 1);
+        await processLine(line);
+        nl = buffer.indexOf("\n");
+      }
+    }
+
+    return {
+      message: {
+        role: "assistant",
+        content,
+        thinking: thinking || undefined,
+        tool_calls: toolCalls.length ? toolCalls : undefined
+      },
+      done: true
+    };
+  }
+
+  async chat(
+    messages: OllamaMessage[],
+    tools: OllamaTool[],
+    onChunk?: (chunk: OllamaChunk) => void | Promise<void>,
+    signal?: AbortSignal
+  ): Promise<OllamaResponse> {
+    let res = await this.postChat(messages, tools, this.thinking, signal);
     if (!res.ok) {
       const body = await res.text();
       if (this.thinking && body.toLowerCase().includes("thinking")) {
         log("thinking not supported, retrying without think flag");
         this.thinking = false;
-        res = await fetch(`${this.baseUrl}/api/chat`, {
-          method: "POST",
-          headers: this.headers(),
-          body: JSON.stringify({
-            model: this.model,
-            messages,
-            tools,
-            stream: false,
-            think: false,
-            options: {num_ctx: this.numCtx}
-          })
-        });
+        res = await this.postChat(messages, tools, false, signal);
         if (!res.ok) {
           const retryBody = await res.text();
           throw new Error(`Ollama /api/chat failed: ${res.status} ${retryBody} ${authErrorHint(res.status)}`);
@@ -176,6 +252,6 @@ export class OllamaClient {
         throw new Error(`Ollama /api/chat failed: ${res.status} ${body} ${authErrorHint(res.status)}`);
       }
     }
-    return await res.json() as OllamaResponse;
+    return this.readChatStream(res, onChunk, signal);
   }
 }
