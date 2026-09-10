@@ -22,7 +22,11 @@ function log(...args: unknown[]): void {
     }
 }
 
-function loadConfig(): { model?: string; baseUrl?: string; thinking?: boolean } {
+type Config = { model?: string; baseUrl?: string; thinking?: boolean; contextSize?: number };
+
+const CONTEXT_SIZES = [4096, 8192, 16384, 32768, 65536, 131072];
+
+function loadConfig(): Config {
     try {
         if (existsSync(CONFIG_FILE)) {
             return JSON.parse(readFileSync(CONFIG_FILE, "utf-8"));
@@ -32,7 +36,7 @@ function loadConfig(): { model?: string; baseUrl?: string; thinking?: boolean } 
     return {};
 }
 
-function saveConfig(config: { model?: string; baseUrl?: string; thinking?: boolean }): void {
+function saveConfig(config: Config): void {
     try {
         if (!existsSync(CONFIG_DIR)) {
             mkdirSync(CONFIG_DIR, {recursive: true});
@@ -43,7 +47,7 @@ function saveConfig(config: { model?: string; baseUrl?: string; thinking?: boole
 }
 
 const savedConfig = loadConfig();
-const ollama = new OllamaClient(savedConfig.baseUrl, savedConfig.model, savedConfig.thinking);
+const ollama = new OllamaClient(savedConfig.baseUrl, savedConfig.model, savedConfig.thinking, savedConfig.contextSize);
 
 type Mode = "agent" | "plan";
 
@@ -387,6 +391,15 @@ function configOptions(models: string[] = []): any[] {
                 {value: "true", name: "Enabled"},
                 {value: "false", name: "Disabled"}
             ]
+        },
+        {
+            id: "ollama_context_size",
+            type: "select",
+            name: "Context Size",
+            description: "Number of context tokens (num_ctx) sent to the model per request.",
+            category: "context",
+            currentValue: String(ollama.getNumCtx()),
+            options: CONTEXT_SIZES.map(s => ({value: String(s), name: String(s)}))
         }
     ];
 }
@@ -414,16 +427,21 @@ app.onRequest("session/set_config_option", async (ctx: any) => {
     if (!session) throw acp.RequestError.invalidParams(undefined, "Unknown session");
     if (ctx.params.configId === "ollama_url" && typeof ctx.params.value === "string") {
         ollama.setBaseUrl(ctx.params.value);
-        saveConfig({model: ollama.getModel(), baseUrl: ctx.params.value, thinking: ollama.isThinking()});
+        saveConfig({model: ollama.getModel(), baseUrl: ctx.params.value, thinking: ollama.isThinking(), contextSize: ollama.getNumCtx()});
     }
     if (ctx.params.configId === "ollama_model" && typeof ctx.params.value === "string") {
         ollama.setModel(ctx.params.value);
-        saveConfig({model: ctx.params.value, baseUrl: ollama.getBaseUrl(), thinking: ollama.isThinking()});
+        saveConfig({model: ctx.params.value, baseUrl: ollama.getBaseUrl(), thinking: ollama.isThinking(), contextSize: ollama.getNumCtx()});
     }
     if (ctx.params.configId === "ollama_thinking" && typeof ctx.params.value === "string") {
         const thinking = ctx.params.value === "true";
         ollama.setThinking(thinking);
         saveConfig({model: ollama.getModel(), baseUrl: ollama.getBaseUrl(), thinking});
+    }
+    if (ctx.params.configId === "ollama_context_size" && typeof ctx.params.value === "string") {
+        const contextSize = Number(ctx.params.value);
+        ollama.setNumCtx(contextSize);
+        saveConfig({model: ollama.getModel(), baseUrl: ollama.getBaseUrl(), thinking: ollama.isThinking(), contextSize});
     }
     const models = await ollama.listModels().catch(() => []);
     return {configOptions: configOptions(models)};

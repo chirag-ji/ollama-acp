@@ -33,15 +33,18 @@ export class OllamaClient {
   private baseUrl: string;
   private model: string;
   private thinking: boolean;
+  private numCtx: number;
 
   constructor(
     baseUrl?: string,
     model?: string,
     thinking?: boolean,
+    numCtx?: number,
   ) {
     this.baseUrl = baseUrl ?? process.env.OLLAMA_URL ?? "http://127.0.0.1:11434";
     this.model = model ?? process.env.OLLAMA_MODEL ?? "qwen3-coder";
     this.thinking = thinking ?? process.env.OLLAMA_THINK !== "false";
+    this.numCtx = numCtx ?? 32768;
   }
 
   getModel(): string { return this.model; }
@@ -50,11 +53,15 @@ export class OllamaClient {
 
   isThinking(): boolean { return this.thinking; }
 
+  getNumCtx(): number { return this.numCtx; }
+
   setBaseUrl(url: string): void { this.baseUrl = url; }
 
   setModel(model: string): void { this.model = model; }
 
   setThinking(thinking: boolean): void { this.thinking = thinking; }
+
+  setNumCtx(numCtx: number): void { this.numCtx = numCtx; }
 
   async listModels(): Promise<string[]> {
     const res = await fetch(`${this.baseUrl}/api/tags`);
@@ -72,7 +79,8 @@ export class OllamaClient {
         messages,
         tools,
         stream: false,
-        think: this.thinking
+        think: this.thinking,
+        options: {num_ctx: this.numCtx}
       })
     });
     if (!res.ok) {
@@ -88,7 +96,8 @@ export class OllamaClient {
             messages,
             tools,
             stream: false,
-            think: false
+            think: false,
+            options: {num_ctx: this.numCtx}
           })
         });
         if (!res.ok) {
