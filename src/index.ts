@@ -6,6 +6,7 @@ import {readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync, read
 import {join} from "node:path";
 import {homedir} from "node:os";
 import {Readable, Writable} from "node:stream";
+import {execFile} from "node:child_process";
 
 export const AGENT_NAME = "ollama-acp";
 export const CONFIG_DIR_NAME = ".ollama-acp";
@@ -175,6 +176,27 @@ type Session = {
 };
 
 const sessions = new Map<string, Session>();
+
+function localExec(command: string, args: string[], cwd: string): Promise<string> {
+    return new Promise((resolve) => {
+        const timeoutMs = 120_000;
+        const child = execFile(command, args, {cwd, timeout: timeoutMs, maxBuffer: 5 * 1024 * 1024}, (error, stdout, stderr) => {
+            const exitCode = error ? (error.code ?? 1) : 0;
+            const parts: string[] = [];
+            if (stdout) parts.push(String(stdout));
+            if (stderr) parts.push(String(stderr));
+            const output = parts.join("").trim();
+            if (error && !stdout && !stderr) {
+                resolve(JSON.stringify({exitCode, error: error.message}, null, 2));
+            } else {
+                resolve(JSON.stringify({exitCode, output}, null, 2));
+            }
+        });
+        child.on("error", (e) => {
+            resolve(JSON.stringify({exitCode: -1, error: e.message}, null, 2));
+        });
+    });
+}
 
 const TOOLS: OllamaTool[] = [
     {
@@ -492,7 +514,8 @@ async function executeTool(
         } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             if (/terminal|shell|not available/i.test(msg)) {
-                return `Tool error: Terminal support is not available in this client. Cannot run shell command: ${command} ${rawArgs.join(" ")}`;
+                log("terminal API unavailable, falling back to local exec:", command, rawArgs.join(" "));
+                return await localExec(command, rawArgs, cwd);
             }
             throw err;
         }
