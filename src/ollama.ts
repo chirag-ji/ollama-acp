@@ -29,11 +29,18 @@ function log(...args: unknown[]): void {
   process.stderr.write(`[ollama] ${msg}\n`);
 }
 
+export type ModelCapabilities = {
+  capabilities: string[];
+  template?: string;
+  details?: Record<string, unknown>;
+};
+
 export class OllamaClient {
   private baseUrl: string;
   private model: string;
   private thinking: boolean;
   private numCtx: number;
+  private cachedCapabilities: Map<string, ModelCapabilities> = new Map();
 
   constructor(
     baseUrl?: string,
@@ -62,6 +69,36 @@ export class OllamaClient {
   setThinking(thinking: boolean): void { this.thinking = thinking; }
 
   setNumCtx(numCtx: number): void { this.numCtx = numCtx; }
+
+  async getModelCapabilities(model?: string): Promise<ModelCapabilities> {
+    const target = model ?? this.model;
+    const cached = this.cachedCapabilities.get(target);
+    if (cached) return cached;
+
+    const res = await fetch(`${this.baseUrl}/api/show`, {
+      method: "POST",
+      headers: {"content-type": "application/json"},
+      body: JSON.stringify({model: target})
+    });
+    if (!res.ok) throw new Error(`Ollama /api/show failed: ${res.status}`);
+    const json = await res.json() as {
+      capabilities?: string[];
+      template?: string;
+      details?: Record<string, unknown>;
+    };
+    const result: ModelCapabilities = {
+      capabilities: json.capabilities ?? [],
+      template: json.template,
+      details: json.details
+    };
+    this.cachedCapabilities.set(target, result);
+    return result;
+  }
+
+  invalidateCapabilities(model?: string): void {
+    const target = model ?? this.model;
+    this.cachedCapabilities.delete(target);
+  }
 
   async listModels(): Promise<string[]> {
     const res = await fetch(`${this.baseUrl}/api/tags`);

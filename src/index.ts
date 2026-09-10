@@ -357,9 +357,35 @@ app.onRequest("initialize", (_ctx: any) => {
     };
 });
 
-function configOptions(models: string[] = []): any[] {
+async function configOptions(models: string[] = []): Promise<any[]> {
     const currentModel = ollama.getModel();
     const allModels = Array.from(new Set([currentModel, ...models]));
+
+    let capabilities: string[] = [];
+    try {
+        const info = await ollama.getModelCapabilities(currentModel);
+        capabilities = info.capabilities;
+    } catch {
+        // If we can't fetch capabilities, proceed without them
+    }
+
+    const supportsThinking = capabilities.includes("thinking");
+
+    // Auto-disable thinking if model doesn't support it
+    if (!supportsThinking && ollama.isThinking()) {
+        ollama.setThinking(false);
+        saveConfig({
+            model: currentModel,
+            baseUrl: ollama.getBaseUrl(),
+            thinking: false,
+            contextSize: ollama.getNumCtx()
+        });
+    }
+
+    const thinkingDescription = supportsThinking
+        ? "Enable reasoning tokens (think mode)."
+        : "This model does not support thinking. Reasoning tokens are disabled.";
+
     return [
         {
             id: "ollama_model",
@@ -368,7 +394,8 @@ function configOptions(models: string[] = []): any[] {
             description: "Model to use for chat completions",
             category: "model",
             currentValue: currentModel,
-            options: allModels.map(m => ({value: m, name: m}))
+            options: allModels.map(m => ({value: m, name: m})),
+            _meta: {capabilities}
         },
         {
             id: "ollama_url",
@@ -384,13 +411,14 @@ function configOptions(models: string[] = []): any[] {
             id: "ollama_thinking",
             type: "select",
             name: "Thinking / Reasoning",
-            description: "Enable reasoning tokens (think mode). Disable for models that do not support thinking (e.g. qwen-coder2.5).",
+            description: thinkingDescription,
             category: "thought_level",
             currentValue: ollama.isThinking() ? "true" : "false",
             options: [
                 {value: "true", name: "Enabled"},
                 {value: "false", name: "Disabled"}
-            ]
+            ],
+            _meta: {capabilities, supported: supportsThinking}
         },
         {
             id: "ollama_context_size",
@@ -418,7 +446,7 @@ app.onRequest("session/new", async (ctx: any) => {
     return {
         sessionId: id,
         modes: modeState(session.mode),
-        configOptions: configOptions(models)
+        configOptions: await configOptions(models)
     };
 });
 
@@ -428,9 +456,11 @@ app.onRequest("session/set_config_option", async (ctx: any) => {
     if (ctx.params.configId === "ollama_url" && typeof ctx.params.value === "string") {
         ollama.setBaseUrl(ctx.params.value);
         saveConfig({model: ollama.getModel(), baseUrl: ctx.params.value, thinking: ollama.isThinking(), contextSize: ollama.getNumCtx()});
+        ollama.invalidateCapabilities();
     }
     if (ctx.params.configId === "ollama_model" && typeof ctx.params.value === "string") {
         ollama.setModel(ctx.params.value);
+        ollama.invalidateCapabilities(ctx.params.value);
         saveConfig({model: ctx.params.value, baseUrl: ollama.getBaseUrl(), thinking: ollama.isThinking(), contextSize: ollama.getNumCtx()});
     }
     if (ctx.params.configId === "ollama_thinking" && typeof ctx.params.value === "string") {
@@ -444,7 +474,7 @@ app.onRequest("session/set_config_option", async (ctx: any) => {
         saveConfig({model: ollama.getModel(), baseUrl: ollama.getBaseUrl(), thinking: ollama.isThinking(), contextSize});
     }
     const models = await ollama.listModels().catch(() => []);
-    return {configOptions: configOptions(models)};
+    return {configOptions: await configOptions(models)};
 });
 
 app.onRequest("session/set_mode", (ctx: any) => {
