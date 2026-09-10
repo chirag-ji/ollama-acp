@@ -588,7 +588,7 @@ async function runAgentTurn(session: Session, client: acp.AgentContext, userText
     if (session.messages.length === 0) session.messages.push({role: "system", content: system});
     session.messages.push({role: "user", content: userText});
 
-    const maxSteps = Number(process.env.MAX_AGENT_STEPS ?? 40);
+    const maxSteps = Number(process.env.MAX_AGENT_STEPS ?? 200);
     for (let step = 0; step < maxSteps; step++) {
         if (session.abort?.signal.aborted) return "cancelled";
 
@@ -661,7 +661,7 @@ async function runAgentTurn(session: Session, client: acp.AgentContext, userText
 
     await emitUpdate(client, session.id, {
         sessionUpdate: "agent_message_chunk",
-        content: {type: "text", text: `Stopped after ${maxSteps} agent steps. Continue the task to resume.`}
+        content: {type: "text", text: `Reached the maximum of ${maxSteps} agent steps. Send another message to continue, or stop if the task is complete.`}
     });
     return "max_turn_requests";
 }
