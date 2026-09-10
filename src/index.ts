@@ -16,6 +16,7 @@ export const CONFIG_DIR_NAME = ".ollama-acp";
 const CONFIG_DIR = join(homedir(), CONFIG_DIR_NAME);
 const STATE_FILE = join(CONFIG_DIR, "state.json");
 const LOG_FILE = join(CONFIG_DIR, "agent.log");
+const RUNTIME_FILE = join(CONFIG_DIR, "runtime.json");
 
 function log(...args: unknown[]): void {
     try {
@@ -25,6 +26,39 @@ function log(...args: unknown[]): void {
         appendFileSync(LOG_FILE, `[${ts}] ${msg}\n`);
     } catch (err) {
         process.stderr.write(`[log error] ${err instanceof Error ? err.message : String(err)}\n`);
+    }
+}
+
+type RuntimeInfo = {
+    pid?: number;
+    startedAt?: string;
+    endedAt?: string;
+    lastStatus?: "running" | "clean" | "unclean";
+    reason?: string;
+};
+
+function readRuntime(): RuntimeInfo {
+    try {
+        if (existsSync(RUNTIME_FILE)) return JSON.parse(readFileSync(RUNTIME_FILE, "utf-8"));
+    } catch {}
+    return {};
+}
+
+function writeRuntime(info: RuntimeInfo): void {
+    try {
+        if (!existsSync(CONFIG_DIR)) mkdirSync(CONFIG_DIR, {recursive: true});
+        writeFileSync(RUNTIME_FILE, JSON.stringify(info, null, 2));
+    } catch (err) {
+        process.stderr.write(`[runtime write error] ${err instanceof Error ? err.message : String(err)}\n`);
+    }
+}
+
+function readLastLogLines(n: number): string[] {
+    try {
+        if (!existsSync(LOG_FILE)) return [];
+        return readFileSync(LOG_FILE, "utf-8").split("\n").filter(Boolean).slice(-n);
+    } catch {
+        return [];
     }
 }
 
@@ -756,6 +790,100 @@ async function runSetup(): Promise<void> {
     await applySetup(url, apiKey);
 }
 
+let shutdownStatus: "clean" | "unclean" = "clean";
+let shutdownReason: string | undefined;
+
+function initLifecycle(): void {
+    const prev = readRuntime();
+    if (prev.lastStatus === "unclean" || prev.lastStatus === "running") {
+        const endedWhy = prev.lastStatus === "running"
+            ? "it ended without a clean shutdown — it was likely killed or crashed"
+            : (prev.reason ?? "it ended uncleanly");
+        const msg = `Previous agent process (PID ${prev.pid ?? "unknown"}, started ${prev.startedAt ?? "unknown"}) — ${endedWhy}.`;
+        log("lifecycle", msg);
+        process.stderr.write(`[${AGENT_NAME}] ${msg}\n`);
+    }
+
+    log("lifecycle started", "pid:", process.pid);
+    writeRuntime({pid: process.pid, startedAt: new Date().toISOString(), lastStatus: "running"});
+
+    process.on("uncaughtException", (err) => {
+        shutdownStatus = "unclean";
+        shutdownReason = `crash: ${err instanceof Error ? err.stack ?? err.message : String(err)}`;
+        log("lifecycle", shutdownReason);
+        process.exit(1);
+    });
+
+    process.on("unhandledRejection", (reason) => {
+        log("lifecycle unhandledRejection:", reason);
+    });
+
+    for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"] as const) {
+        process.on(sig, () => {
+            shutdownStatus = "unclean";
+            shutdownReason = `terminated by ${sig}`;
+            log("lifecycle", shutdownReason);
+            process.exit(0);
+        });
+    }
+
+    process.on("exit", () => {
+        const ended = {endedAt: new Date().toISOString()};
+        if (shutdownStatus === "unclean") {
+            writeRuntime({...readRuntime(), ...ended, lastStatus: "unclean", reason: shutdownReason});
+        } else {
+            writeRuntime({...readRuntime(), ...ended, lastStatus: "clean"});
+        }
+    });
+}
+
+function printStatus(): void {
+    const r = readRuntime();
+    const lines: string[] = [`${AGENT_NAME} status:`];
+    if (r.pid) {
+        let alive = false;
+        try { process.kill(r.pid, 0); alive = true; } catch {}
+        lines.push(`  Agent process PID: ${r.pid} — ${alive ? "ALIVE" : "not running"}`);
+        if (r.startedAt) lines.push(`  Started: ${r.startedAt}`);
+    } else {
+        lines.push("  No agent instance has been recorded yet.");
+    }
+    const statusText: Record<NonNullable<RuntimeInfo["lastStatus"]>, string> = {
+        running: "running (or killed/crashed without a clean shutdown — no clean exit was recorded)",
+        clean: "clean",
+        unclean: "unclean"
+    };
+    lines.push(`  Last exit: ${r.lastStatus ? statusText[r.lastStatus] : "unknown"}${r.reason ? ` — ${r.reason}` : ""}`);
+    if (r.endedAt) lines.push(`  Ended: ${r.endedAt}`);
+    lines.push(`  Config dir: ${CONFIG_DIR}`);
+    lines.push(`  Log file: ${LOG_FILE}`);
+    const lastLogs = readLastLogLines(5);
+    if (lastLogs.length) {
+        lines.push("  Last log lines:");
+        lines.push(...lastLogs.map(l => `    ${l}`));
+    }
+    console.log(lines.join("\n"));
+}
+
+function printHelp(): void {
+    console.log(`Ollama ACP — local coding agent for JetBrains IDEs backed by Ollama.
+
+Usage:
+  ${AGENT_NAME}                 Start the ACP agent (talks ACP JSON-RPC over stdin/stdout).
+  ${AGENT_NAME} --setup         Run interactive setup to configure the Ollama server URL and optional API key.
+  ${AGENT_NAME} --status        Show whether the agent is running and how the previous run ended (clean vs killed/crashed).
+  ${AGENT_NAME} --help          Show this help.
+
+Termination / crash detection:
+  - SIGTERM, SIGINT, SIGHUP are logged and recorded as an "unclean" exit.
+  - SIGKILL (kill -9) and crashes cannot be caught; the next run detects the missing clean exit and reports it in the log and on stderr.
+  - Run '${AGENT_NAME} --status' anytime to see the last recorded run and its exit state.
+
+State:
+  Config: ${CONFIG_DIR}
+  Log:    ${LOG_FILE}`);
+}
+
 app.onRequest("initialize", (ctx: any) => {
     log("initialize", "client:", JSON.stringify(ctx.params?.clientInfo));
     const caps = ctx.params?.clientCapabilities;
@@ -969,12 +1097,20 @@ app.onNotification("session/cancel", (ctx: any) => {
     sessions.get(ctx.params.sessionId)?.abort?.abort();
 });
 
-if (process.argv.includes("--setup")) {
+const argSet = new Set(process.argv.slice(2));
+if (argSet.has("--setup")) {
     runSetup().then(() => process.exit(0)).catch(err => {
         process.stderr.write(`Setup failed: ${err instanceof Error ? err.message : err}\n`);
         process.exit(1);
     });
+} else if (argSet.has("--status")) {
+    printStatus();
+    process.exit(0);
+} else if (argSet.has("--help") || argSet.has("-h")) {
+    printHelp();
+    process.exit(0);
 } else {
+    initLifecycle();
     const input = Writable.toWeb(process.stdout) as unknown as WritableStream<Uint8Array>;
     const output = Readable.toWeb(process.stdin) as unknown as ReadableStream<Uint8Array>;
     const stream = ndJsonStream(input, output);
