@@ -42,6 +42,13 @@ export type ModelCapabilities = {
   details?: Record<string, unknown>;
 };
 
+function authErrorHint(status: number): string {
+    if (status === 401 || status === 403) {
+        return "Server rejected authentication. Run 'ollama-acp --setup' to configure an API key, or unset OLLAMA_API_KEY for a local Ollama server that requires no auth.";
+    }
+    return "";
+}
+
 export class OllamaClient {
   private baseUrl: string;
   private model: string;
@@ -100,7 +107,7 @@ export class OllamaClient {
       headers: this.headers(),
       body: JSON.stringify({model: target})
     });
-    if (!res.ok) throw new Error(`Ollama /api/show failed: ${res.status}`);
+    if (!res.ok) throw new Error(`Ollama /api/show failed: ${res.status}. ${authErrorHint(res.status)}`);
     const json = await res.json() as {
       capabilities?: string[];
       template?: string;
@@ -124,7 +131,7 @@ export class OllamaClient {
     const res = await fetch(`${this.baseUrl}/api/tags`, {
       headers: this.headers()
     });
-    if (!res.ok) throw new Error(`Ollama /api/tags failed: ${res.status}`);
+    if (!res.ok) throw new Error(`Ollama /api/tags failed: ${res.status}. ${authErrorHint(res.status)}`);
     const json = await res.json() as { models?: Array<{ name: string }> };
     const names = (json.models ?? []).map(m => m.name);
     log(`listModels: got ${names.length} models: ${JSON.stringify(names)}`);
@@ -163,10 +170,10 @@ export class OllamaClient {
         });
         if (!res.ok) {
           const retryBody = await res.text();
-          throw new Error(`Ollama /api/chat failed: ${res.status} ${retryBody}`);
+          throw new Error(`Ollama /api/chat failed: ${res.status} ${retryBody} ${authErrorHint(res.status)}`);
         }
       } else {
-        throw new Error(`Ollama /api/chat failed: ${res.status} ${body}`);
+        throw new Error(`Ollama /api/chat failed: ${res.status} ${body} ${authErrorHint(res.status)}`);
       }
     }
     return await res.json() as OllamaResponse;

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import * as acp from "@agentclientprotocol/sdk";
 import {ndJsonStream} from "@agentclientprotocol/sdk";
-import {OllamaClient, type OllamaMessage, type OllamaTool} from "./ollama.js";
+import {OllamaClient, type OllamaMessage, type OllamaTool, type OllamaResponse} from "./ollama.js";
 import {randomUUID} from "node:crypto";
 import {readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync, readdirSync, statSync} from "node:fs";
 import {join} from "node:path";
@@ -625,7 +625,19 @@ async function runAgentTurn(session: Session, client: acp.AgentContext, userText
             content: {type: "text", text: `Step ${step + 1}: reasoning about the next action…`}
         });
 
-        const response = await ollama.chat(session.messages, TOOLS);
+        let response: OllamaResponse;
+        try {
+            response = await ollama.chat(session.messages, TOOLS);
+        } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            log("ollama.chat error", session.id, msg);
+            session.messages.push({role: "system", content: `The previous model call failed: ${msg}`});
+            await emitUpdate(client, session.id, {
+                sessionUpdate: "agent_message_chunk",
+                content: {type: "text", text: `[Ollama error] ${msg}`}
+            });
+            return "end_turn";
+        }
         const assistant = response.message;
         log("ollama response", session.id, "step:", step + 1, "tool_calls:", assistant.tool_calls?.length ?? 0, "content:", (assistant.content ?? "").slice(0, 200));
         if (assistant.thinking) {
