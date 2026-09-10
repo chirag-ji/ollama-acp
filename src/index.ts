@@ -8,7 +8,7 @@ import {homedir} from "node:os";
 import {Readable, Writable} from "node:stream";
 
 const CONFIG_DIR = join(homedir(), ".ollama-intellij-acp");
-const CONFIG_FILE = join(CONFIG_DIR, "config.json");
+const STATE_FILE = join(CONFIG_DIR, "state.json");
 const LOG_FILE = join(CONFIG_DIR, "agent.log");
 
 function log(...args: unknown[]): void {
@@ -22,32 +22,64 @@ function log(...args: unknown[]): void {
     }
 }
 
-type Config = { model?: string; baseUrl?: string; thinking?: boolean; contextSize?: number };
+type State = { model?: string; thinking?: boolean; contextSize?: number; urls?: string[]; activeUrl?: string };
 
 const CONTEXT_SIZES = [4096, 8192, 16384, 32768, 65536, 131072];
+const DEFAULT_URL = "http://127.0.0.1:11434";
+const ADD_URL_OPTION = "__acp_add_url__";
 
-function loadConfig(): Config {
+let supportsElicitationForm = false;
+let clientName = "unknown";
+
+function normalizeUrl(raw: string): string {
+    const trimmed = raw.trim();
+    if (!trimmed) return "";
+    return /^https?:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`;
+}
+
+function loadState(): State {
     try {
-        if (existsSync(CONFIG_FILE)) {
-            return JSON.parse(readFileSync(CONFIG_FILE, "utf-8"));
+        if (existsSync(STATE_FILE)) {
+            return JSON.parse(readFileSync(STATE_FILE, "utf-8"));
         }
     } catch {
     }
     return {};
 }
 
-function saveConfig(config: Config): void {
+function saveState(state: State): void {
     try {
         if (!existsSync(CONFIG_DIR)) {
             mkdirSync(CONFIG_DIR, {recursive: true});
         }
-        writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
+        writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
     } catch {
     }
 }
 
-const savedConfig = loadConfig();
-const ollama = new OllamaClient(savedConfig.baseUrl, savedConfig.model, savedConfig.thinking, savedConfig.contextSize);
+function persistUrlsState(urls: string[], activeUrl: string): void {
+    saveState({model: ollama.getModel(), thinking: ollama.isThinking(), contextSize: ollama.getNumCtx(), urls, activeUrl});
+}
+
+function ensureUrls(state: State): string[] {
+    if (!state.urls || state.urls.length === 0) {
+        return [DEFAULT_URL];
+    }
+    return state.urls;
+}
+
+function getActiveUrl(state: State): string {
+    const urls = ensureUrls(state);
+    if (state.activeUrl && urls.includes(state.activeUrl)) {
+        return state.activeUrl;
+    }
+    return urls[0];
+}
+
+const savedState = loadState();
+const initialUrls = ensureUrls(savedState);
+const initialActiveUrl = getActiveUrl(savedState);
+const ollama = new OllamaClient(initialActiveUrl, savedState.model, savedState.thinking, savedState.contextSize);
 
 type Mode = "agent" | "plan";
 
@@ -101,6 +133,41 @@ const TOOLS: OllamaTool[] = [
                 }
             }
         }
+    },
+    {
+        type: "function",
+        function: {
+            name: "add_url",
+            description: "Add a new Ollama server URL to the saved list. The URL will be normalized (http:// prepended if no scheme). After adding, it becomes the active URL.",
+            parameters: {
+                type: "object",
+                required: ["url"],
+                properties: {url: {type: "string"}}
+            }
+        }
+    },
+    {
+        type: "function",
+        function: {
+            name: "remove_url",
+            description: "Remove an Ollama server URL from the saved list. Cannot remove the last URL. If the removed URL was active, the first remaining URL becomes active.",
+            parameters: {
+                type: "object",
+                required: ["url"],
+                properties: {url: {type: "string"}}
+            }
+        }
+    },
+    {
+        type: "function",
+        function: {
+            name: "list_urls",
+            description: "List all saved Ollama server URLs and show which one is currently active.",
+            parameters: {
+                type: "object",
+                properties: {}
+            }
+        }
     }
 ];
 
@@ -149,6 +216,58 @@ function modeState(mode: Mode): any {
 
 async function emitUpdate(client: acp.AgentContext, sessionId: string, update: any) {
     await client.notify(acp.methods.client.session.update, {sessionId, update});
+}
+
+async function emitConfigUpdate(client: acp.AgentContext, sessionId: string, models: string[] = []) {
+    try {
+        const opts = await configOptions(models);
+        await client.notify(acp.methods.client.session.update, {
+            sessionId,
+            update: {sessionUpdate: "config_option_update", configOptions: opts}
+        });
+    } catch (err) {
+        log("emitConfigUpdate failed:", err);
+    }
+}
+
+async function promptForUrl(client: acp.AgentContext, sessionId: string): Promise<string | null> {
+    if (!supportsElicitationForm) {
+        throw acp.RequestError.invalidParams(
+            undefined,
+            `This client (${clientName}) does not support interactive input. Ask the agent in chat instead, e.g.: "add url http://127.0.0.1:11434"`
+        );
+    }
+    try {
+        const result = await client.request(acp.methods.client.elicitation.create, {
+            mode: "form",
+            sessionId,
+            message: "Enter the base URL of the Ollama server you want to connect to.",
+            requestedSchema: {
+                type: "object",
+                properties: {
+                    url: {
+                        type: "string",
+                        title: "Ollama URL",
+                        description: "e.g. http://127.0.0.1:11434 or https://ollama.example.com",
+                        format: "uri",
+                        default: DEFAULT_URL
+                    }
+                },
+                required: ["url"]
+            }
+        });
+        if (result.action === "accept" && result.content && typeof result.content.url === "string") {
+            return normalizeUrl(result.content.url) || null;
+        }
+        log("promptForUrl: not accepted:", JSON.stringify(result));
+        return null;
+    } catch (err) {
+        log("promptForUrl failed:", err);
+        throw acp.RequestError.invalidParams(
+            undefined,
+            `Unable to collect a URL from this client (${clientName}). Ask the agent in chat instead, e.g.: "add url http://127.0.0.1:11434"`
+        );
+    }
 }
 
 async function requestPermission(
@@ -243,6 +362,47 @@ async function executeTool(
         }
     }
 
+    if (name === "add_url") {
+        const rawUrl = String(args.url).trim();
+        if (!rawUrl) return "Error: URL cannot be empty.";
+        const url = normalizeUrl(rawUrl);
+        const urls = currentUrls();
+        if (urls.includes(url)) return `URL ${url} already exists. Current URLs: ${urls.join(", ")}`;
+        urls.push(url);
+        ollama.setBaseUrl(url);
+        ollama.invalidateCapabilities();
+        persistUrlsState(urls, url);
+        await emitConfigUpdate(client, sessionId);
+        return `Added ${url}. It is now the active URL. All saved URLs: ${urls.join(", ")}`;
+    }
+
+    if (name === "remove_url") {
+        const rawUrl = String(args.url).trim();
+        if (!rawUrl) return "Error: URL cannot be empty.";
+        const url = normalizeUrl(rawUrl);
+        const urls = currentUrls();
+        if (!urls.includes(url)) return `URL ${url} not found. Current URLs: ${urls.join(", ")}`;
+        if (urls.length === 1) return "Error: cannot remove the last URL. Add another URL first.";
+        const updated = urls.filter(u => u !== url);
+        const activeUrl = currentActiveUrl();
+        let newActive = activeUrl;
+        if (activeUrl === url) {
+            newActive = updated[0];
+            ollama.setBaseUrl(newActive);
+            ollama.invalidateCapabilities();
+        }
+        persistUrlsState(updated, newActive);
+        await emitConfigUpdate(client, sessionId);
+        return `Removed ${url}. Active URL: ${newActive}. Remaining URLs: ${updated.join(", ")}`;
+    }
+
+    if (name === "list_urls") {
+        const urls = currentUrls();
+        const active = currentActiveUrl();
+        const lines = urls.map(u => u === active ? `${u} (active)` : u);
+        return `Saved URLs:\n${lines.join("\n")}`;
+    }
+
     return `Unknown tool: ${name}`;
 }
 
@@ -256,7 +416,8 @@ async function runAgentTurn(session: Session, client: acp.AgentContext, userText
             ? "PLAN MODE: do not modify files or run mutating commands. Inspect and produce a concrete implementation plan."
             : "AGENT MODE: autonomously work toward the user's goal. Inspect first, make focused edits, run relevant checks, fix failures, and summarize the result.",
         "Prefer small, verifiable changes. Never invent file contents when you can read them.",
-        "Use tools instead of merely telling the user what they could do."
+        "Use tools instead of merely telling the user what they could do.",
+        "URL management: the \"Ollama URL\" dropdown in the IDE config UI has an \"Add new URL...\" entry that lets the user type a new server URL directly. You can also use list_urls to show saved URLs, add_url to add a server URL, remove_url to remove one. When the user asks to connect/switch to an Ollama server or mentions a URL, prefer list_urls/add_url."
     ].join("\n");
 
     if (session.messages.length === 0) session.messages.push({role: "system", content: system});
@@ -303,7 +464,7 @@ async function runAgentTurn(session: Session, client: acp.AgentContext, userText
                 sessionUpdate: "tool_call",
                 toolCallId: id,
                 title,
-                kind: call.function.name === "read_file" ? "read" : call.function.name === "write_file" ? "edit" : "execute",
+                kind: call.function.name === "read_file" || call.function.name === "list_urls" ? "read" : call.function.name === "write_file" || call.function.name === "add_url" || call.function.name === "remove_url" ? "edit" : "execute",
                 status: "in_progress",
                 rawInput: call.function.arguments
             });
@@ -345,8 +506,11 @@ const output = Readable.toWeb(process.stdin) as unknown as ReadableStream<Uint8A
 const stream = ndJsonStream(input, output);
 const app = acp.agent({name: "ollama-intellij-acp"});
 
-app.onRequest("initialize", (_ctx: any) => {
-    log("initialize");
+app.onRequest("initialize", (ctx: any) => {
+    log("initialize", "client:", JSON.stringify(ctx.params?.clientInfo));
+    const caps = ctx.params?.clientCapabilities;
+    supportsElicitationForm = Boolean(caps?.elicitation?.form);
+    clientName = ctx.params?.clientInfo?.name ?? "unknown";
     return {
         protocolVersion: acp.PROTOCOL_VERSION,
         agentCapabilities: {
@@ -357,34 +521,45 @@ app.onRequest("initialize", (_ctx: any) => {
     };
 });
 
+function currentUrls(): string[] {
+    return ensureUrls(loadState());
+}
+
+function currentActiveUrl(): string {
+    return getActiveUrl(loadState());
+}
+
 async function configOptions(models: string[] = []): Promise<any[]> {
     const currentModel = ollama.getModel();
     const allModels = Array.from(new Set([currentModel, ...models]));
+    log("configOptions:", "current:", currentModel, "fromApi:", JSON.stringify(models), "merged:", JSON.stringify(allModels));
 
     let capabilities: string[] = [];
     try {
         const info = await ollama.getModelCapabilities(currentModel);
         capabilities = info.capabilities;
     } catch {
-        // If we can't fetch capabilities, proceed without them
     }
 
     const supportsThinking = capabilities.includes("thinking");
 
-    // Auto-disable thinking if model doesn't support it
     if (!supportsThinking && ollama.isThinking()) {
         ollama.setThinking(false);
-        saveConfig({
+        saveState({
             model: currentModel,
-            baseUrl: ollama.getBaseUrl(),
             thinking: false,
-            contextSize: ollama.getNumCtx()
+            contextSize: ollama.getNumCtx(),
+            urls: currentUrls(),
+            activeUrl: currentActiveUrl()
         });
     }
 
     const thinkingDescription = supportsThinking
         ? "Enable reasoning tokens (think mode)."
         : "This model does not support thinking. Reasoning tokens are disabled.";
+
+    const urls = currentUrls();
+    const activeUrl = currentActiveUrl();
 
     return [
         {
@@ -401,10 +576,11 @@ async function configOptions(models: string[] = []): Promise<any[]> {
             id: "ollama_url",
             type: "select",
             name: "Ollama URL",
-            description: "Base URL of the Ollama server",
-            currentValue: ollama.getBaseUrl(),
+            description: "Base URL of the Ollama server. Choose an existing URL, or pick \"Add new URL...\" to enter a new one.",
+            currentValue: activeUrl,
             options: [
-                {value: ollama.getBaseUrl(), name: ollama.getBaseUrl()}
+                ...urls.map(u => ({value: u, name: u})),
+                {value: ADD_URL_OPTION, name: "Add new URL..."}
             ]
         },
         {
@@ -435,7 +611,8 @@ async function configOptions(models: string[] = []): Promise<any[]> {
 app.onRequest("session/new", async (ctx: any) => {
     const id = randomUUID();
     log("session/new", id, "cwd:", ctx.params.cwd);
-    const models = await ollama.listModels().catch(() => []);
+    const models = await ollama.listModels().catch((err) => { log("listModels failed:", err); return []; });
+    log("session/new models:", JSON.stringify(models), "current:", ollama.getModel());
     const session: Session = {
         id,
         cwd: ctx.params.cwd,
@@ -454,26 +631,49 @@ app.onRequest("session/set_config_option", async (ctx: any) => {
     const session = sessions.get(ctx.params.sessionId);
     if (!session) throw acp.RequestError.invalidParams(undefined, "Unknown session");
     if (ctx.params.configId === "ollama_url" && typeof ctx.params.value === "string") {
-        ollama.setBaseUrl(ctx.params.value);
-        saveConfig({model: ollama.getModel(), baseUrl: ctx.params.value, thinking: ollama.isThinking(), contextSize: ollama.getNumCtx()});
-        ollama.invalidateCapabilities();
+        const urls = currentUrls();
+        if (ctx.params.value === ADD_URL_OPTION) {
+            const newUrl = await promptForUrl(ctx.client, ctx.params.sessionId);
+            if (newUrl) {
+                const updated = urls.includes(newUrl) ? urls : [...urls, newUrl];
+                ollama.setBaseUrl(newUrl);
+                ollama.invalidateCapabilities();
+                persistUrlsState(updated, newUrl);
+                log("set_config_option added url:", newUrl);
+            }
+        } else if (!urls.includes(ctx.params.value)) {
+            throw acp.RequestError.invalidParams(undefined, "Unknown URL. Use add_url to add new URLs.");
+        } else {
+            ollama.setBaseUrl(ctx.params.value);
+            ollama.invalidateCapabilities();
+            persistUrlsState(urls, ctx.params.value);
+        }
     }
     if (ctx.params.configId === "ollama_model" && typeof ctx.params.value === "string") {
         ollama.setModel(ctx.params.value);
         ollama.invalidateCapabilities(ctx.params.value);
-        saveConfig({model: ctx.params.value, baseUrl: ollama.getBaseUrl(), thinking: ollama.isThinking(), contextSize: ollama.getNumCtx()});
+        let thinking = ollama.isThinking();
+        try {
+            const info = await ollama.getModelCapabilities(ctx.params.value);
+            if (thinking && !info.capabilities.includes("thinking")) {
+                thinking = false;
+                ollama.setThinking(false);
+            }
+        } catch {}
+        saveState({model: ctx.params.value, thinking, contextSize: ollama.getNumCtx(), urls: currentUrls(), activeUrl: currentActiveUrl()});
     }
     if (ctx.params.configId === "ollama_thinking" && typeof ctx.params.value === "string") {
         const thinking = ctx.params.value === "true";
         ollama.setThinking(thinking);
-        saveConfig({model: ollama.getModel(), baseUrl: ollama.getBaseUrl(), thinking});
+        saveState({model: ollama.getModel(), thinking, urls: currentUrls(), activeUrl: currentActiveUrl()});
     }
     if (ctx.params.configId === "ollama_context_size" && typeof ctx.params.value === "string") {
         const contextSize = Number(ctx.params.value);
         ollama.setNumCtx(contextSize);
-        saveConfig({model: ollama.getModel(), baseUrl: ollama.getBaseUrl(), thinking: ollama.isThinking(), contextSize});
+        saveState({model: ollama.getModel(), thinking: ollama.isThinking(), contextSize, urls: currentUrls(), activeUrl: currentActiveUrl()});
     }
-    const models = await ollama.listModels().catch(() => []);
+    const models = await ollama.listModels().catch((err) => { log("listModels failed on config change:", err); return []; });
+    log("set_config_option models:", JSON.stringify(models));
     return {configOptions: await configOptions(models)};
 });
 

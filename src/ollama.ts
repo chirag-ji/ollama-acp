@@ -29,6 +29,13 @@ function log(...args: unknown[]): void {
   process.stderr.write(`[ollama] ${msg}\n`);
 }
 
+function normalizeHost(host?: string): string | undefined {
+  if (!host) return undefined;
+  const trimmed = host.trim();
+  if (!trimmed) return undefined;
+  return /^https?:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`;
+}
+
 export type ModelCapabilities = {
   capabilities: string[];
   template?: string;
@@ -48,7 +55,7 @@ export class OllamaClient {
     thinking?: boolean,
     numCtx?: number,
   ) {
-    this.baseUrl = baseUrl ?? process.env.OLLAMA_URL ?? "http://127.0.0.1:11434";
+    this.baseUrl = baseUrl ?? process.env.OLLAMA_BASE_URL ?? process.env.OLLAMA_URL ?? normalizeHost(process.env.OLLAMA_HOST) ?? "http://127.0.0.1:11434";
     this.model = model ?? process.env.OLLAMA_MODEL ?? "qwen3-coder";
     this.thinking = thinking ?? process.env.OLLAMA_THINK !== "false";
     this.numCtx = numCtx ?? 32768;
@@ -104,7 +111,9 @@ export class OllamaClient {
     const res = await fetch(`${this.baseUrl}/api/tags`);
     if (!res.ok) throw new Error(`Ollama /api/tags failed: ${res.status}`);
     const json = await res.json() as { models?: Array<{ name: string }> };
-    return (json.models ?? []).map(m => m.name);
+    const names = (json.models ?? []).map(m => m.name);
+    log(`listModels: got ${names.length} models: ${JSON.stringify(names)}`);
+    return names;
   }
 
   async chat(messages: OllamaMessage[], tools: OllamaTool[]): Promise<OllamaResponse> {
