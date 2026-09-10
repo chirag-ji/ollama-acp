@@ -1,18 +1,20 @@
 import { spawn } from "node:child_process";
-import { tags, chat } from "../src/ollama.js";
+import { OllamaClient } from "../src/ollama.js";
 
 async function main() {
   console.log("=== Ollama ACP debug ===");
+  const ollama = new OllamaClient();
+
   console.log("1. Ollama health...");
-  const t:any = await tags();
-  console.log(`   PASS: ${t.models?.length ?? 0} model(s)`);
+  const models = await ollama.listModels();
+  console.log(`   PASS: ${models.length} model(s)`);
 
   console.log("2. Ollama chat...");
-  const c:any = await chat("Reply with exactly ACP_OK");
+  const c:any = await ollama.chat([{role:"user",content:"Reply with exactly ACP_OK"}], []);
   console.log(`   PASS: ${(c.message?.content ?? "").slice(0,200)}`);
 
   console.log("3. ACP initialize + session/new...");
-  const p = spawn(process.execPath, ["dist/src/index.js"], {stdio:["pipe","pipe","pipe"], env:process.env});
+  const p = spawn(process.execPath, ["dist/index.js"], {stdio:["pipe","pipe","pipe"], env:process.env});
   let out="", err="";
   p.stdout.on("data", d => out += d.toString());
   p.stderr.on("data", d => err += d.toString());

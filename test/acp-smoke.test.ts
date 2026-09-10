@@ -1,15 +1,17 @@
 import {describe,it,expect} from "vitest";
 import {spawn} from "node:child_process";
-import {textFromPrompt} from "../src/index.js";
+import type {PromptRequest} from "@agentclientprotocol/sdk";
+import {textFromPrompt,AGENT_NAME,CONFIG_DIR_NAME} from "../src/index.js";
+import {OllamaClient} from "../src/ollama.js";
 
 describe("textFromPrompt",()=>{
   it("extracts plain text",()=>{
-    const prompt=[{type:"text",text:"hello world"}];
+    const prompt:PromptRequest["prompt"]=[{type:"text",text:"hello world"}];
     expect(textFromPrompt(prompt)).toBe("hello world");
   });
 
   it("extracts multiple text blocks",()=>{
-    const prompt=[
+    const prompt:PromptRequest["prompt"]=[
       {type:"text",text:"first line"},
       {type:"text",text:"second line"}
     ];
@@ -17,7 +19,7 @@ describe("textFromPrompt",()=>{
   });
 
   it("extracts embedded resource (file content)",()=>{
-    const prompt=[{
+    const prompt:PromptRequest["prompt"]=[{
       type:"resource",
       resource:{uri:"file:///path/to/file.ts",text:"const x=1;"}
     }];
@@ -27,7 +29,7 @@ describe("textFromPrompt",()=>{
   });
 
   it("extracts resource_link",()=>{
-    const prompt=[{
+    const prompt:PromptRequest["prompt"]=[{
       type:"resource_link",
       name:"index.ts",
       uri:"file:///src/index.ts"
@@ -38,7 +40,7 @@ describe("textFromPrompt",()=>{
   });
 
   it("handles mixed content types",()=>{
-    const prompt=[
+    const prompt:PromptRequest["prompt"]=[
       {type:"text",text:"look at this file:"},
       {type:"resource",resource:{uri:"file:///src/app.ts",text:"export const app=()=>{};"}},
       {type:"resource_link",name:"utils.ts",uri:"file:///src/utils.ts"}
@@ -51,7 +53,7 @@ describe("textFromPrompt",()=>{
   });
 
   it("ignores unknown content types",()=>{
-    const prompt=[
+    const prompt:PromptRequest["prompt"]=[
       {type:"text",text:"visible"},
       {type:"image",data:"base64data",mimeType:"image/png"}
     ];
@@ -60,6 +62,48 @@ describe("textFromPrompt",()=>{
 
   it("handles empty prompt",()=>{
     expect(textFromPrompt([])).toBe("");
+  });
+});
+
+describe("renamed project identity",()=>{
+  it("uses ollama-acp as the agent name",()=>{
+    expect(AGENT_NAME).toBe("ollama-acp");
+  });
+
+  it("stores config under the .ollama-acp directory",()=>{
+    expect(CONFIG_DIR_NAME).toBe(".ollama-acp");
+  });
+
+  it("does not reference the old project name",()=>{
+    expect(AGENT_NAME).not.toContain("intellij");
+    expect(CONFIG_DIR_NAME).not.toContain("intellij");
+  });
+});
+
+describe("OllamaClient context size",()=>{
+  it("defaults to 32768",()=>{
+    const c=new OllamaClient();
+    expect(c.getNumCtx()).toBe(32768);
+  });
+
+  it("accepts custom context size via constructor",()=>{
+    const c=new OllamaClient(undefined,undefined,undefined,16384);
+    expect(c.getNumCtx()).toBe(16384);
+  });
+
+  it("updates via setNumCtx",()=>{
+    const c=new OllamaClient();
+    c.setNumCtx(65536);
+    expect(c.getNumCtx()).toBe(65536);
+  });
+
+  it("setNumCtx does not affect other fields",()=>{
+    const c=new OllamaClient("http://localhost:8080","mymodel",false,8192);
+    c.setNumCtx(131072);
+    expect(c.getNumCtx()).toBe(131072);
+    expect(c.getBaseUrl()).toBe("http://localhost:8080");
+    expect(c.getModel()).toBe("mymodel");
+    expect(c.isThinking()).toBe(false);
   });
 });
 
