@@ -7,7 +7,10 @@ import {join} from "node:path";
 import {homedir} from "node:os";
 import {Readable, Writable} from "node:stream";
 
-const CONFIG_DIR = join(homedir(), ".ollama-intellij-acp");
+export const AGENT_NAME = "ollama-acp";
+export const CONFIG_DIR_NAME = ".ollama-acp";
+
+const CONFIG_DIR = join(homedir(), CONFIG_DIR_NAME);
 const STATE_FILE = join(CONFIG_DIR, "state.json");
 const LOG_FILE = join(CONFIG_DIR, "agent.log");
 
@@ -571,7 +574,7 @@ async function executeTool(
 
 async function runAgentTurn(session: Session, client: acp.AgentContext, userText: string): Promise<acp.StopReason> {
     const system = [
-        "You are Ollama IntelliJ ACP, a local autonomous coding agent running inside IntelliJ IDEA.",
+        "You are Ollama ACP, a local autonomous coding agent running inside IntelliJ IDEA.",
         "You are not a chat-only assistant. You can inspect files, modify files, run commands, run tests/builds, and iterate.",
         `Workspace: ${session.cwd}`,
         `Mode: ${session.mode}`,
@@ -669,7 +672,7 @@ async function runAgentTurn(session: Session, client: acp.AgentContext, userText
 const input = Writable.toWeb(process.stdout) as unknown as WritableStream<Uint8Array>;
 const output = Readable.toWeb(process.stdin) as unknown as ReadableStream<Uint8Array>;
 const stream = ndJsonStream(input, output);
-const app = acp.agent({name: "ollama-intellij-acp"});
+const app = acp.agent({name: AGENT_NAME});
 
 app.onRequest("initialize", (ctx: any) => {
     log("initialize", "client:", JSON.stringify(ctx.params?.clientInfo));

@@ -1,4 +1,4 @@
-# Ollama IntelliJ ACP Agent
+# Ollama ACP Agent
 
 A local, ACP-native coding agent for IntelliJ IDEA / JetBrains AI Assistant backed by Ollama.
 
@@ -44,7 +44,7 @@ JetBrains AI Assistant supports external ACP agents. Add a custom ACP agent and 
 **Command**
 
 ```text
-node /absolute/path/to/ollama-intellij-acp/dist/index.js
+node /absolute/path/to/ollama-acp/dist/index.js
 ```
 
 Environment variables:
@@ -74,7 +74,7 @@ IntelliJ IDEA / AI Assistant
         |
         | ACP / JSON-RPC over stdio
         v
-ollama-intellij-acp
+ollama-acp
         |
         +-- ACP session + permission + tool-call updates
         |

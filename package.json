@@ -1,5 +1,5 @@
 {
-  "name": "ollama-intellij-acp",
+  "name": "ollama-acp",
   "version": "0.1.0",
   "private": true,
   "type": "module",
