@@ -2,7 +2,7 @@ import * as acp from "@agentclientprotocol/sdk";
 import {ndJsonStream} from "@agentclientprotocol/sdk";
 import {OllamaClient, type OllamaMessage, type OllamaTool} from "./ollama.js";
 import {randomUUID} from "node:crypto";
-import {readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync} from "node:fs";
+import {readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync, readdirSync, statSync} from "node:fs";
 import {join} from "node:path";
 import {homedir} from "node:os";
 import {Readable, Writable} from "node:stream";
@@ -35,6 +35,86 @@ function normalizeUrl(raw: string): string {
     const trimmed = raw.trim();
     if (!trimmed) return "";
     return /^https?:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`;
+}
+
+const SKIP_DIRS = new Set(["node_modules", ".git", ".venv", "__pycache__", "build", "dist", ".idea", "target", ".gradle"]);
+
+function globMatch(name: string, pattern: string): boolean {
+    const regex = pattern
+        .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+        .replace(/\*\*/g, "{{GLOBSTAR}}")
+        .replace(/\*/g, "[^/]*")
+        .replace(/\?/g, "[^/]")
+        .replace(/\{\{GLOBSTAR\}\}/g, ".*");
+    return new RegExp(`^${regex}$`, "i").test(name);
+}
+
+function listDirSync(dirPath: string, pattern?: string): string {
+    const entries = readdirSync(dirPath, {withFileTypes: true});
+    const lines: string[] = [];
+    for (const entry of entries) {
+        if (entry.name.startsWith(".") && !pattern) continue;
+        if (pattern && !globMatch(entry.name, pattern)) continue;
+        lines.push(entry.isDirectory() ? `${entry.name}/` : entry.name);
+    }
+    lines.sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+    return lines.length ? lines.join("\n") : "(empty directory)";
+}
+
+function searchFilesSync(root: string, pattern: string): string {
+    const results: string[] = [];
+    function walk(dir: string) {
+        if (results.length >= 100) return;
+        let entries;
+        try { entries = readdirSync(dir, {withFileTypes: true}); } catch { return; }
+        for (const entry of entries) {
+            if (results.length >= 100) return;
+            if (SKIP_DIRS.has(entry.name)) continue;
+            const full = join(dir, entry.name);
+            if (entry.isDirectory()) {
+                walk(full);
+            } else if (globMatch(entry.name, pattern) || globMatch(full.replace(root, "").replace(/^\//, ""), pattern)) {
+                results.push(full);
+            }
+        }
+    }
+    walk(root);
+    return results.length ? results.join("\n") : "(no matching files)";
+}
+
+function searchContentSync(searchPath: string, query: string, filePattern?: string): string {
+    const results: string[] = [];
+    let regex: RegExp;
+    try { regex = new RegExp(query, "gi"); } catch { regex = new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"); }
+    function walk(dir: string) {
+        if (results.length >= 100) return;
+        let entries;
+        try { entries = readdirSync(dir, {withFileTypes: true}); } catch { return; }
+        for (const entry of entries) {
+            if (results.length >= 100) return;
+            if (SKIP_DIRS.has(entry.name)) continue;
+            const full = join(dir, entry.name);
+            if (entry.isDirectory()) {
+                walk(full);
+            } else if (filePattern && filePattern !== "*" && !globMatch(entry.name, filePattern)) {
+                continue;
+            } else if (entry.isFile()) {
+                try {
+                    const content = readFileSync(full, "utf-8");
+                    const lines = content.split("\n");
+                    for (let i = 0; i < lines.length; i++) {
+                        if (results.length >= 100) return;
+                        regex.lastIndex = 0;
+                        if (regex.test(lines[i])) {
+                            results.push(`${full}:${i + 1}:${lines[i]}`);
+                        }
+                    }
+                } catch {}
+            }
+        }
+    }
+    walk(searchPath);
+    return results.length ? results.join("\n") : "(no matches found)";
 }
 
 function loadState(): State {
@@ -382,28 +462,36 @@ async function executeTool(
             if (!allowed) return "DENIED by user.";
         }
 
-        const created = await client.request(acp.methods.client.terminal.create, {
-            sessionId,
-            command,
-            args: rawArgs,
-            cwd,
-            outputByteLimit: 200000
-        });
         try {
-            const waited = await client.request(acp.methods.client.terminal.waitForExit, {
+            const created = await client.request(acp.methods.client.terminal.create, {
                 sessionId,
-                terminalId: created.terminalId
+                command,
+                args: rawArgs,
+                cwd,
+                outputByteLimit: 200000
             });
-            const output = await client.request(acp.methods.client.terminal.output, {
-                sessionId,
-                terminalId: created.terminalId
-            });
-            return JSON.stringify({exitCode: waited.exitCode, signal: waited.signal, output: output.output}, null, 2);
-        } finally {
-            await client.request(acp.methods.client.terminal.release, {
-                sessionId,
-                terminalId: created.terminalId
-            }).catch(() => undefined);
+            try {
+                const waited = await client.request(acp.methods.client.terminal.waitForExit, {
+                    sessionId,
+                    terminalId: created.terminalId
+                });
+                const output = await client.request(acp.methods.client.terminal.output, {
+                    sessionId,
+                    terminalId: created.terminalId
+                });
+                return JSON.stringify({exitCode: waited.exitCode, signal: waited.signal, output: output.output}, null, 2);
+            } finally {
+                await client.request(acp.methods.client.terminal.release, {
+                    sessionId,
+                    terminalId: created.terminalId
+                }).catch(() => undefined);
+            }
+        } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            if (/terminal|shell|not available/i.test(msg)) {
+                return `Tool error: Terminal support is not available in this client. Cannot run shell command: ${command} ${rawArgs.join(" ")}`;
+            }
+            throw err;
         }
     }
 
@@ -451,87 +539,30 @@ async function executeTool(
     if (name === "list_directory") {
         const path = String(args.path);
         const pattern = typeof args.pattern === "string" ? args.pattern : undefined;
-        const cmd = pattern
-            ? `find "${path}" -maxdepth 1 -name '${pattern}' -not -name '.*' | sort`
-            : `ls -1a "${path}"`;
-        const created = await client.request(acp.methods.client.terminal.create, {
-            sessionId,
-            command: "sh",
-            args: ["-c", cmd],
-            cwd: session.cwd,
-            outputByteLimit: 50000
-        });
         try {
-            await client.request(acp.methods.client.terminal.waitForExit, {
-                sessionId,
-                terminalId: created.terminalId
-            });
-            const output = await client.request(acp.methods.client.terminal.output, {
-                sessionId,
-                terminalId: created.terminalId
-            });
-            return output.output || "(empty directory)";
-        } finally {
-            await client.request(acp.methods.client.terminal.release, {
-                sessionId,
-                terminalId: created.terminalId
-            }).catch(() => undefined);
+            return listDirSync(path, pattern);
+        } catch (err) {
+            return `Tool error: ${err instanceof Error ? err.message : String(err)}`;
         }
     }
 
     if (name === "search_files") {
         const pattern = String(args.pattern);
-        const created = await client.request(acp.methods.client.terminal.create, {
-            sessionId,
-            command: "sh",
-            args: ["-c", `find "${session.cwd}" -type f -path '${pattern}' -not -path '*/node_modules/*' -not -path '*/.git/*' -not -path '*/.venv/*' -not -path '*/__pycache__/*' -not -path '*/build/*' -not -path '*/dist/*' 2>/dev/null | head -100`],
-            cwd: session.cwd,
-            outputByteLimit: 50000
-        });
         try {
-            await client.request(acp.methods.client.terminal.waitForExit, {
-                sessionId,
-                terminalId: created.terminalId
-            });
-            const output = await client.request(acp.methods.client.terminal.output, {
-                sessionId,
-                terminalId: created.terminalId
-            });
-            return output.output || "(no matching files)";
-        } finally {
-            await client.request(acp.methods.client.terminal.release, {
-                sessionId,
-                terminalId: created.terminalId
-            }).catch(() => undefined);
+            return searchFilesSync(session.cwd, pattern);
+        } catch (err) {
+            return `Tool error: ${err instanceof Error ? err.message : String(err)}`;
         }
     }
 
     if (name === "search_content") {
         const query = String(args.query);
         const searchPath = typeof args.path === "string" ? args.path : session.cwd;
-        const filePattern = typeof args.pattern === "string" ? args.pattern : "*";
-        const created = await client.request(acp.methods.client.terminal.create, {
-            sessionId,
-            command: "sh",
-            args: ["-c", `rg --no-heading -n --glob '!node_modules' --glob '!.git' --glob '!.venv' --glob '!__pycache__' --glob '!build' --glob '!dist' -g '${filePattern}' '${query.replace(/'/g, "'\\''")}' "${searchPath}" 2>/dev/null | head -100`],
-            cwd: session.cwd,
-            outputByteLimit: 50000
-        });
+        const filePattern = typeof args.pattern === "string" ? args.pattern : undefined;
         try {
-            await client.request(acp.methods.client.terminal.waitForExit, {
-                sessionId,
-                terminalId: created.terminalId
-            });
-            const output = await client.request(acp.methods.client.terminal.output, {
-                sessionId,
-                terminalId: created.terminalId
-            });
-            return output.output || "(no matches found)";
-        } finally {
-            await client.request(acp.methods.client.terminal.release, {
-                sessionId,
-                terminalId: created.terminalId
-            }).catch(() => undefined);
+            return searchContentSync(searchPath, query, filePattern);
+        } catch (err) {
+            return `Tool error: ${err instanceof Error ? err.message : String(err)}`;
         }
     }
 
