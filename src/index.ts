@@ -168,6 +168,51 @@ const TOOLS: OllamaTool[] = [
                 properties: {}
             }
         }
+    },
+    {
+        type: "function",
+        function: {
+            name: "list_directory",
+            description: "List files and subdirectories in a directory. Use absolute paths. Returns file names with / for directories.",
+            parameters: {
+                type: "object",
+                required: ["path"],
+                properties: {
+                    path: {type: "string", description: "Absolute path to the directory to list"},
+                    pattern: {type: "string", description: "Optional glob pattern to filter results, e.g. '*.ts' or '**/*.java'"}
+                }
+            }
+        }
+    },
+    {
+        type: "function",
+        function: {
+            name: "search_files",
+            description: "Find files by name pattern in the workspace. Returns matching file paths. Use glob patterns like '**/*.ts' or 'src/**/*.java'.",
+            parameters: {
+                type: "object",
+                required: ["pattern"],
+                properties: {
+                    pattern: {type: "string", description: "Glob pattern to match files, e.g. '**/*.ts' or 'src/**/test*'"}
+                }
+            }
+        }
+    },
+    {
+        type: "function",
+        function: {
+            name: "search_content",
+            description: "Search for text content across files in the workspace. Returns matching lines with file paths and line numbers.",
+            parameters: {
+                type: "object",
+                required: ["query"],
+                properties: {
+                    query: {type: "string", description: "Text or regex pattern to search for"},
+                    path: {type: "string", description: "Optional directory to search within (absolute path)"},
+                    pattern: {type: "string", description: "Optional file pattern filter, e.g. '*.ts' or '*.java'"}
+                }
+            }
+        }
     }
 ];
 
@@ -403,6 +448,93 @@ async function executeTool(
         return `Saved URLs:\n${lines.join("\n")}`;
     }
 
+    if (name === "list_directory") {
+        const path = String(args.path);
+        const pattern = typeof args.pattern === "string" ? args.pattern : undefined;
+        const cmd = pattern
+            ? `find "${path}" -maxdepth 1 -name '${pattern}' -not -name '.*' | sort`
+            : `ls -1a "${path}"`;
+        const created = await client.request(acp.methods.client.terminal.create, {
+            sessionId,
+            command: "sh",
+            args: ["-c", cmd],
+            cwd: session.cwd,
+            outputByteLimit: 50000
+        });
+        try {
+            await client.request(acp.methods.client.terminal.waitForExit, {
+                sessionId,
+                terminalId: created.terminalId
+            });
+            const output = await client.request(acp.methods.client.terminal.output, {
+                sessionId,
+                terminalId: created.terminalId
+            });
+            return output.output || "(empty directory)";
+        } finally {
+            await client.request(acp.methods.client.terminal.release, {
+                sessionId,
+                terminalId: created.terminalId
+            }).catch(() => undefined);
+        }
+    }
+
+    if (name === "search_files") {
+        const pattern = String(args.pattern);
+        const created = await client.request(acp.methods.client.terminal.create, {
+            sessionId,
+            command: "sh",
+            args: ["-c", `find "${session.cwd}" -type f -path '${pattern}' -not -path '*/node_modules/*' -not -path '*/.git/*' -not -path '*/.venv/*' -not -path '*/__pycache__/*' -not -path '*/build/*' -not -path '*/dist/*' 2>/dev/null | head -100`],
+            cwd: session.cwd,
+            outputByteLimit: 50000
+        });
+        try {
+            await client.request(acp.methods.client.terminal.waitForExit, {
+                sessionId,
+                terminalId: created.terminalId
+            });
+            const output = await client.request(acp.methods.client.terminal.output, {
+                sessionId,
+                terminalId: created.terminalId
+            });
+            return output.output || "(no matching files)";
+        } finally {
+            await client.request(acp.methods.client.terminal.release, {
+                sessionId,
+                terminalId: created.terminalId
+            }).catch(() => undefined);
+        }
+    }
+
+    if (name === "search_content") {
+        const query = String(args.query);
+        const searchPath = typeof args.path === "string" ? args.path : session.cwd;
+        const filePattern = typeof args.pattern === "string" ? args.pattern : "*";
+        const created = await client.request(acp.methods.client.terminal.create, {
+            sessionId,
+            command: "sh",
+            args: ["-c", `rg --no-heading -n --glob '!node_modules' --glob '!.git' --glob '!.venv' --glob '!__pycache__' --glob '!build' --glob '!dist' -g '${filePattern}' '${query.replace(/'/g, "'\\''")}' "${searchPath}" 2>/dev/null | head -100`],
+            cwd: session.cwd,
+            outputByteLimit: 50000
+        });
+        try {
+            await client.request(acp.methods.client.terminal.waitForExit, {
+                sessionId,
+                terminalId: created.terminalId
+            });
+            const output = await client.request(acp.methods.client.terminal.output, {
+                sessionId,
+                terminalId: created.terminalId
+            });
+            return output.output || "(no matches found)";
+        } finally {
+            await client.request(acp.methods.client.terminal.release, {
+                sessionId,
+                terminalId: created.terminalId
+            }).catch(() => undefined);
+        }
+    }
+
     return `Unknown tool: ${name}`;
 }
 
@@ -415,6 +547,8 @@ async function runAgentTurn(session: Session, client: acp.AgentContext, userText
         session.mode === "plan"
             ? "PLAN MODE: do not modify files or run mutating commands. Inspect and produce a concrete implementation plan."
             : "AGENT MODE: autonomously work toward the user's goal. Inspect first, make focused edits, run relevant checks, fix failures, and summarize the result.",
+        "CRITICAL WORKFLOW: Before making any changes, explore the workspace thoroughly. Use list_directory and search_files to understand the project structure. Use search_content to find all usages of functions/classes you plan to modify. Use read_file to read related files that might need updates. Never assume file contents — always read them first.",
+        "When modifying a file, check for imports, usages, tests, and related code that may also need changes. Use search_content to find all references before editing.",
         "Prefer small, verifiable changes. Never invent file contents when you can read them.",
         "Use tools instead of merely telling the user what they could do.",
         "URL management: the \"Ollama URL\" dropdown in the IDE config UI has an \"Add new URL...\" entry that lets the user type a new server URL directly. You can also use list_urls to show saved URLs, add_url to add a server URL, remove_url to remove one. When the user asks to connect/switch to an Ollama server or mentions a URL, prefer list_urls/add_url."
@@ -464,7 +598,7 @@ async function runAgentTurn(session: Session, client: acp.AgentContext, userText
                 sessionUpdate: "tool_call",
                 toolCallId: id,
                 title,
-                kind: call.function.name === "read_file" || call.function.name === "list_urls" ? "read" : call.function.name === "write_file" || call.function.name === "add_url" || call.function.name === "remove_url" ? "edit" : "execute",
+                kind: call.function.name === "read_file" || call.function.name === "list_urls" || call.function.name === "list_directory" || call.function.name === "search_files" || call.function.name === "search_content" ? "read" : call.function.name === "write_file" || call.function.name === "add_url" || call.function.name === "remove_url" ? "edit" : "execute",
                 status: "in_progress",
                 rawInput: call.function.arguments
             });
