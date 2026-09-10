@@ -4,8 +4,9 @@ import {ndJsonStream} from "@agentclientprotocol/sdk";
 import {OllamaClient, type OllamaMessage, type OllamaTool, type OllamaResponse} from "./ollama.js";
 import {randomUUID} from "node:crypto";
 import {readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync, readdirSync, statSync} from "node:fs";
-import {join} from "node:path";
+import {join, relative, isAbsolute, resolve} from "node:path";
 import {homedir} from "node:os";
+import {fileURLToPath} from "node:url";
 import {Readable, Writable} from "node:stream";
 import {execFile} from "node:child_process";
 import * as readline from "node:readline";
@@ -155,6 +156,83 @@ function searchContentSync(searchPath: string, query: string, filePattern?: stri
     }
     walk(searchPath);
     return results.length ? results.join("\n") : "(no matches found)";
+}
+
+type FileChange = {path: string; change: "created" | "modified" | "deleted"};
+type FileChangeTracker = Map<string, {path: string; kind: "created" | "modified"}>;
+
+export function snapshotFiles(root: string): Map<string, string> {
+    const snap = new Map<string, string>();
+    function walk(dir: string): void {
+        let entries;
+        try { entries = readdirSync(dir, {withFileTypes: true}); } catch { return; }
+        for (const entry of entries) {
+            if (SKIP_DIRS.has(entry.name)) continue;
+            const full = join(dir, entry.name);
+            if (entry.isDirectory()) {
+                walk(full);
+            } else if (entry.isFile()) {
+                try {
+                    const st = statSync(full);
+                    snap.set(full, `${st.size}:${st.mtimeMs}`);
+                } catch {}
+            }
+        }
+    }
+    walk(root);
+    return snap;
+}
+
+export function diffSnapshots(before: Map<string, string>, after: Map<string, string>): FileChange[] {
+    const changes: FileChange[] = [];
+    for (const [path, sig] of after) {
+        const prev = before.get(path);
+        if (prev === undefined) changes.push({path, change: "created"});
+        else if (prev !== sig) changes.push({path, change: "modified"});
+    }
+    for (const path of before.keys()) {
+        if (!after.has(path)) changes.push({path, change: "deleted"});
+    }
+    return changes;
+}
+
+export function mergeFileChanges(snapshotChanges: FileChange[], tracker: FileChangeTracker | undefined): FileChange[] {
+    const byPath = new Map<string, FileChange>();
+    for (const c of snapshotChanges) byPath.set(c.path, c);
+    for (const t of tracker?.values() ?? []) {
+        const existing = byPath.get(t.path);
+        if (!existing) byPath.set(t.path, {path: t.path, change: t.kind});
+        else if (existing.change === "modified" && t.kind === "created") byPath.set(t.path, {path: t.path, change: "created"});
+    }
+    return [...byPath.values()];
+}
+
+async function emitFileChangesSummary(
+    client: acp.AgentContext,
+    sessionId: string,
+    workspace: string,
+    tracker: FileChangeTracker | undefined,
+    snapshotChanges: FileChange[]
+): Promise<void> {
+    const changes = mergeFileChanges(snapshotChanges, tracker);
+    if (changes.length === 0) return;
+    const order: Record<FileChange["change"], number> = {created: 0, modified: 1, deleted: 2};
+    changes.sort((a, b) => order[a.change] - order[b.change] || a.path.localeCompare(b.path));
+    const maxShown = 50;
+    const shown = changes.slice(0, maxShown);
+    const label: Record<FileChange["change"], string> = {created: "A", modified: "M", deleted: "D"};
+    const lines = shown.map(c => `${label[c.change]}  ${relative(workspace, c.path) || c.path}`);
+    const more = changes.length > maxShown ? `\n… and ${changes.length - maxShown} more` : "";
+    const text = `File changes:\n${lines.join("\n")}${more}`;
+    try {
+        await emitUpdate(client, sessionId, {
+            sessionUpdate: "agent_message_chunk",
+            content: {type: "text", text}
+        });
+        log("file_changes_summary", sessionId, `${changes.length} changed files`);
+    } catch (err) {
+        log("file_changes_summary failed:", sessionId, err);
+    }
 }
 
 function loadState(): State {
@@ -485,7 +563,8 @@ async function executeTool(
     client: acp.AgentContext,
     sessionId: string,
     name: string,
-    args: Record<string, unknown>
+    args: Record<string, unknown>,
+    tracker?: FileChangeTracker
 ): Promise<string> {
     if (name === "read_file") {
         const path = String(args.path);
@@ -501,9 +580,12 @@ async function executeTool(
         if (session.mode === "plan") return "DENIED: plan mode is read-only.";
         const path = String(args.path);
         const content = String(args.content);
+        const abs = isAbsolute(path) ? path : join(session.cwd, path);
+        const existed = existsSync(abs);
         const allowed = await requestPermission(client, sessionId, `Write ${path}`, "edit", path);
         if (!allowed) return "DENIED by user.";
         await client.request(acp.methods.client.fs.writeTextFile, {sessionId, path, content});
+        if (tracker && !tracker.has(abs)) tracker.set(abs, {path: abs, kind: existed ? "modified" : "created"});
         return `Wrote ${path}`;
     }
 
@@ -650,9 +732,16 @@ async function runAgentTurn(session: Session, client: acp.AgentContext, userText
     if (session.messages.length === 0) session.messages.push({role: "system", content: system});
     session.messages.push({role: "user", content: userText});
 
+    const before = snapshotFiles(session.cwd);
+    const tracker: FileChangeTracker = new Map();
+    const finish = async (reason: acp.StopReason): Promise<acp.StopReason> => {
+        await emitFileChangesSummary(client, session.id, session.cwd, tracker, diffSnapshots(before, snapshotFiles(session.cwd)));
+        return reason;
+    };
+
     const maxSteps = Number(process.env.MAX_AGENT_STEPS ?? 200);
     for (let step = 0; step < maxSteps; step++) {
-        if (session.abort?.signal.aborted) return "cancelled";
+        if (session.abort?.signal.aborted) return finish("cancelled");
 
         await emitUpdate(client, session.id, {
             sessionUpdate: "agent_thought_chunk",
@@ -670,7 +759,7 @@ async function runAgentTurn(session: Session, client: acp.AgentContext, userText
                 sessionUpdate: "agent_message_chunk",
                 content: {type: "text", text: `[Ollama error] ${msg}`}
             });
-            return "end_turn";
+            return finish("end_turn");
         }
         const assistant = response.message;
         log("ollama response", session.id, "step:", step + 1, "tool_calls:", assistant.tool_calls?.length ?? 0, "content:", (assistant.content ?? "").slice(0, 200));
@@ -694,7 +783,7 @@ async function runAgentTurn(session: Session, client: acp.AgentContext, userText
         }
 
         const calls = assistant.tool_calls ?? [];
-        if (calls.length === 0) return "end_turn";
+        if (calls.length === 0) return finish("end_turn");
 
         for (const call of calls) {
             const id = randomUUID();
@@ -711,7 +800,7 @@ async function runAgentTurn(session: Session, client: acp.AgentContext, userText
             let result: string;
             try {
                 log("tool_call", session.id, call.function.name, JSON.stringify(call.function.arguments).slice(0, 300));
-                result = await executeTool(session, client, session.id, call.function.name, call.function.arguments);
+                result = await executeTool(session, client, session.id, call.function.name, call.function.arguments, tracker);
             } catch (error) {
                 result = `Tool error: ${error instanceof Error ? error.message : String(error)}`;
                 log("tool_error", session.id, call.function.name, result);
@@ -737,7 +826,7 @@ async function runAgentTurn(session: Session, client: acp.AgentContext, userText
         sessionUpdate: "agent_message_chunk",
         content: {type: "text", text: `Reached the maximum of ${maxSteps} agent steps. Send another message to continue, or stop if the task is complete.`}
     });
-    return "max_turn_requests";
+    return finish("max_turn_requests");
 }
 
 const app = acp.agent({name: AGENT_NAME});
@@ -1098,21 +1187,24 @@ app.onNotification("session/cancel", (ctx: any) => {
 });
 
 const argSet = new Set(process.argv.slice(2));
-if (argSet.has("--setup")) {
-    runSetup().then(() => process.exit(0)).catch(err => {
-        process.stderr.write(`Setup failed: ${err instanceof Error ? err.message : err}\n`);
-        process.exit(1);
-    });
-} else if (argSet.has("--status")) {
-    printStatus();
-    process.exit(0);
-} else if (argSet.has("--help") || argSet.has("-h")) {
-    printHelp();
-    process.exit(0);
-} else {
-    initLifecycle();
-    const input = Writable.toWeb(process.stdout) as unknown as WritableStream<Uint8Array>;
-    const output = Readable.toWeb(process.stdin) as unknown as ReadableStream<Uint8Array>;
-    const stream = ndJsonStream(input, output);
-    app.connect(stream);
+const isMain = Boolean(process.argv[1]) && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isMain) {
+    if (argSet.has("--setup")) {
+        runSetup().then(() => process.exit(0)).catch(err => {
+            process.stderr.write(`Setup failed: ${err instanceof Error ? err.message : err}\n`);
+            process.exit(1);
+        });
+    } else if (argSet.has("--status")) {
+        printStatus();
+        process.exit(0);
+    } else if (argSet.has("--help") || argSet.has("-h")) {
+        printHelp();
+        process.exit(0);
+    } else {
+        initLifecycle();
+        const input = Writable.toWeb(process.stdout) as unknown as WritableStream<Uint8Array>;
+        const output = Readable.toWeb(process.stdin) as unknown as ReadableStream<Uint8Array>;
+        const stream = ndJsonStream(input, output);
+        app.connect(stream);
+    }
 }
