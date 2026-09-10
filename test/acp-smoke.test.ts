@@ -1,5 +1,6 @@
 import {describe,it,expect} from "vitest";
 import {spawn} from "node:child_process";
+import {createServer, type Server} from "node:http";
 import type {PromptRequest} from "@agentclientprotocol/sdk";
 import {textFromPrompt,AGENT_NAME,CONFIG_DIR_NAME} from "../src/index.js";
 import {OllamaClient} from "../src/ollama.js";
@@ -124,5 +125,100 @@ describe("ACP",()=>{
     expect(x.result).toBeTruthy();
     expect(x.result.protocolVersion).toBe(1);
     expect(x.result.agentCapabilities).toBeTruthy();
+  });
+
+  it("declares a terminal auth method for the registry",async()=>{
+    const p=spawn(process.execPath,["dist/index.js"],{stdio:["pipe","pipe","pipe"]});
+    const x:any=await new Promise((resolve,reject)=>{
+      let b=""; const timer=setTimeout(()=>reject(new Error("timeout")),3000);
+      p.stdout.on("data",d=>{
+        b+=d.toString();
+        for(const line of b.split("\n").slice(0,-1)){try{
+          const j=JSON.parse(line); if(j.id===1){clearTimeout(timer);p.kill();resolve(j);return;}
+        }catch{}}
+        b=b.split("\n").pop()??"";
+      });
+      p.stdin.write(JSON.stringify({jsonrpc:"2.0",id:1,method:"initialize",params:{protocolVersion:1,clientCapabilities:{auth:{terminal:true}},clientInfo:{name:"test",version:"1"}}})+"\n");
+    });
+    expect(Array.isArray(x.result.authMethods)).toBe(true);
+    expect(x.result.authMethods.length).toBeGreaterThan(0);
+    expect(x.result.authMethods[0].type).toBe("terminal");
+    expect(x.result.authMethods[0].args).toContain("--setup");
+  });
+
+  it("runs the setup flow when invoked with --setup",async()=>{
+    const p=spawn(process.execPath,["dist/index.js","--setup"],{stdio:["pipe","pipe","pipe"]});
+    p.stdin.end("http://127.0.0.1:11434\n\n");
+    const exitCode:number=await new Promise(resolve=>{
+      p.on("exit",code=>resolve(code??-1));
+      setTimeout(()=>{p.kill();resolve(-999);},3000);
+    });
+    expect(exitCode).toBe(0);
+  });
+});
+
+describe("OllamaClient auth",()=>{
+  it("reads an api key from the constructor",()=>{
+    const c=new OllamaClient("http://localhost:11434",undefined,undefined,undefined,"sk-test");
+    expect(c.getApiKey()).toBe("sk-test");
+  });
+
+  it("returns undefined api key when none is set",()=>{
+    const c=new OllamaClient();
+    expect(c.getApiKey()).toBeUndefined();
+  });
+
+  it("setApiKey updates the stored key",()=>{
+    const c=new OllamaClient();
+    c.setApiKey("sk-updated");
+    expect(c.getApiKey()).toBe("sk-updated");
+    c.setApiKey(undefined);
+    expect(c.getApiKey()).toBeUndefined();
+  });
+
+  it("sends the bearer token to all endpoints",async()=>{
+    const seen:Array<{path:string;auth?:string}>=[]; let server:Server|undefined;
+    server=createServer((req,res)=>{
+      seen.push({path:req.url??"",auth:req.headers.authorization});
+      res.setHeader("content-type","application/json");
+      res.end(req.url==="/api/tags"?"[]":'{"message":{"role":"assistant","content":"hi"}}');
+    });
+    await new Promise<void>(resolve=>server.listen(0,"127.0.0.1",resolve));
+    const port=(server.address() as any).port;
+    try{
+      const c=new OllamaClient(`http://127.0.0.1:${port}`,undefined,undefined,undefined,"secret-token");
+      await c.listModels();
+      await c.getModelCapabilities();
+      await c.chat([{role:"user",content:"x"}],[{type:"function",function:{name:"f",description:"",parameters:{}}}]);
+    }finally{
+      await new Promise<void>(resolve=>server.close(()=>resolve()));
+    }
+    expect(seen.length).toBe(3);
+    for(const s of seen){
+      expect(s.auth).toBe("Bearer secret-token");
+    }
+  });
+
+  it("omits the auth header when no api key is set",async()=>{
+    const seen:Array<string>=[];
+    const server=createServer((req,res)=>{
+      seen.push(req.headers.authorization??"__none__");
+      res.setHeader("content-type","application/json");
+      res.end("[]");
+    });
+    await new Promise<void>(resolve=>server.listen(0,"127.0.0.1",resolve));
+    const port=(server.address() as any).port;
+    try{
+      const c=new OllamaClient(`http://127.0.0.1:${port}`);
+      await c.listModels();
+    }finally{
+      await new Promise<void>(resolve=>server.close(()=>resolve()));
+    }
+    expect(seen).toEqual(["__none__"]);
+  });
+
+  it("does not send a bearer token for unauthenticated requests",()=>{
+    const c=new OllamaClient("http://localhost:11434",undefined,undefined,undefined,"");
+    expect(c.getApiKey()).toBeUndefined();
   });
 });

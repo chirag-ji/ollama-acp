@@ -47,6 +47,7 @@ export class OllamaClient {
   private model: string;
   private thinking: boolean;
   private numCtx: number;
+  private apiKey?: string;
   private cachedCapabilities: Map<string, ModelCapabilities> = new Map();
 
   constructor(
@@ -54,11 +55,23 @@ export class OllamaClient {
     model?: string,
     thinking?: boolean,
     numCtx?: number,
+    apiKey?: string,
   ) {
     this.baseUrl = baseUrl ?? process.env.OLLAMA_BASE_URL ?? process.env.OLLAMA_URL ?? normalizeHost(process.env.OLLAMA_HOST) ?? "http://127.0.0.1:11434";
     this.model = model ?? process.env.OLLAMA_MODEL ?? "qwen3-coder";
     this.thinking = thinking ?? process.env.OLLAMA_THINK !== "false";
     this.numCtx = numCtx ?? 32768;
+    this.apiKey = (apiKey ?? process.env.OLLAMA_API_KEY)?.trim() || undefined;
+  }
+
+  getApiKey(): string | undefined { return this.apiKey; }
+
+  setApiKey(apiKey: string | undefined): void { this.apiKey = apiKey; }
+
+  private headers(): Record<string, string> {
+    const h: Record<string, string> = {"content-type": "application/json"};
+    if (this.apiKey) h["authorization"] = `Bearer ${this.apiKey}`;
+    return h;
   }
 
   getModel(): string { return this.model; }
@@ -84,7 +97,7 @@ export class OllamaClient {
 
     const res = await fetch(`${this.baseUrl}/api/show`, {
       method: "POST",
-      headers: {"content-type": "application/json"},
+      headers: this.headers(),
       body: JSON.stringify({model: target})
     });
     if (!res.ok) throw new Error(`Ollama /api/show failed: ${res.status}`);
@@ -108,7 +121,9 @@ export class OllamaClient {
   }
 
   async listModels(): Promise<string[]> {
-    const res = await fetch(`${this.baseUrl}/api/tags`);
+    const res = await fetch(`${this.baseUrl}/api/tags`, {
+      headers: this.headers()
+    });
     if (!res.ok) throw new Error(`Ollama /api/tags failed: ${res.status}`);
     const json = await res.json() as { models?: Array<{ name: string }> };
     const names = (json.models ?? []).map(m => m.name);
@@ -119,7 +134,7 @@ export class OllamaClient {
   async chat(messages: OllamaMessage[], tools: OllamaTool[]): Promise<OllamaResponse> {
     let res = await fetch(`${this.baseUrl}/api/chat`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: this.headers(),
       body: JSON.stringify({
         model: this.model,
         messages,
@@ -136,7 +151,7 @@ export class OllamaClient {
         this.thinking = false;
         res = await fetch(`${this.baseUrl}/api/chat`, {
           method: "POST",
-          headers: { "content-type": "application/json" },
+          headers: this.headers(),
           body: JSON.stringify({
             model: this.model,
             messages,

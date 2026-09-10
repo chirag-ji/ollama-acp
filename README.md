@@ -20,9 +20,29 @@ It is deliberately **not chat-only**. The agent loop can:
 - a tool-capable coding model. `qwen3-coder` is a good starting point.
 - IntelliJ IDEA with ACP support in AI Assistant
 
-Ollama's local API does not require authentication. Ollama supports tool calling and multi-turn agent loops through `/api/chat`. See the official docs for the API and tool-calling behavior.
+Ollama's local API does not require authentication. For remote/authenticated servers, a Bearer token can be configured at setup. Ollama supports tool calling and multi-turn agent loops through `/api/chat`. See the official docs for the API and tool-calling behavior.
 
-## Install
+## Install from the ACP registry
+
+`ollama-acp` is listed in the [ACP registry](https://github.com/agentclientprotocol/registry) and can be run directly with `npx`:
+
+```bash
+npx ollama-acp
+```
+
+When a JetBrains IDE with ACP support asks for the agent command, use:
+
+```text
+npx ollama-acp@latest
+```
+
+The first run through the IDE's authentication flow launches an interactive terminal setup where you can configure the Ollama server URL and an optional API key. You can also run the same setup manually:
+
+```bash
+npx ollama-acp --setup
+```
+
+## Build from source
 
 ```bash
 npm install
@@ -54,6 +74,14 @@ OLLAMA_URL=http://127.0.0.1:11434
 OLLAMA_MODEL=qwen3-coder
 MAX_AGENT_STEPS=40
 ```
+
+Optional environment variable for remote/authenticated Ollama servers:
+
+```text
+OLLAMA_API_KEY=
+```
+
+The API key, when set, is sent as a `Bearer` token on every request. It can also be stored via the terminal setup (`--setup`) in `~/.ollama-acp/state.json` instead of an environment variable.
 
 The exact UI location for adding a custom ACP agent can vary by JetBrains release. ACP is the integration layer; this process is the agent, while IntelliJ remains the client that owns files, terminals, permissions, and presentation.
 

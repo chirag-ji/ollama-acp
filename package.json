@@ -1,19 +1,50 @@
 {
   "name": "ollama-acp",
   "version": "0.1.0",
-  "private": true,
+  "description": "A local, ACP-native coding agent for JetBrains IDEs backed by Ollama. It can inspect, edit, and test your code, run shell commands, and iterate until the task is done.",
   "type": "module",
+  "bin": {
+    "ollama-acp": "dist/index.js"
+  },
+  "main": "dist/index.js",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
   "engines": { "node": ">=20" },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "prepublishOnly": "npm run build",
     "start": "node dist/index.js",
+    "setup": "node dist/index.js --setup",
     "dev": "tsx src/index.ts",
     "test": "vitest run",
     "debug": "tsx test/debug.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
+  "keywords": [
+    "acp",
+    "agent-client-protocol",
+    "ollama",
+    "ai",
+    "coding-agent",
+    "jetbrains",
+    "intellij"
+  ],
+  "license": "MIT",
+  "author": "Chirag Gupta",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/chirag-ji/ollama-acp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/chirag-ji/ollama-acp/issues"
+  },
+  "homepage": "https://github.com/chirag-ji/ollama-acp#readme",
   "dependencies": {
-    "@agentclientprotocol/sdk": "latest"
+    "@agentclientprotocol/sdk": "^0.27.1"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

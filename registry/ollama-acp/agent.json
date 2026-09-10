@@ -1,0 +1,17 @@
+{
+  "id": "ollama-acp",
+  "name": "Ollama ACP",
+  "version": "0.1.0",
+  "description": "A local, ACP-native coding agent for JetBrains IDEs backed by Ollama. It can inspect, edit, and test your code, run shell commands, and iterate until the task is done.",
+  "repository": "https://github.com/chirag-ji/ollama-acp",
+  "website": "https://github.com/chirag-ji/ollama-acp#readme",
+  "authors": ["Chirag Gupta"],
+  "license": "MIT",
+  "license_url": "https://github.com/chirag-ji/ollama-acp/blob/main/LICENSE",
+  "icon": "./icon.svg",
+  "distribution": {
+    "npx": {
+      "package": "ollama-acp@0.1.0"
+    }
+  }
+}

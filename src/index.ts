@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 import * as acp from "@agentclientprotocol/sdk";
 import {ndJsonStream} from "@agentclientprotocol/sdk";
 import {OllamaClient, type OllamaMessage, type OllamaTool} from "./ollama.js";
@@ -7,6 +8,7 @@ import {join} from "node:path";
 import {homedir} from "node:os";
 import {Readable, Writable} from "node:stream";
 import {execFile} from "node:child_process";
+import * as readline from "node:readline";
 
 export const AGENT_NAME = "ollama-acp";
 export const CONFIG_DIR_NAME = ".ollama-acp";
@@ -26,7 +28,7 @@ function log(...args: unknown[]): void {
     }
 }
 
-type State = { model?: string; thinking?: boolean; contextSize?: number; urls?: string[]; activeUrl?: string };
+type State = { model?: string; thinking?: boolean; contextSize?: number; urls?: string[]; activeUrl?: string; apiKey?: string };
 
 const CONTEXT_SIZES = [4096, 8192, 16384, 32768, 65536, 131072];
 const DEFAULT_URL = "http://127.0.0.1:11434";
@@ -142,7 +144,7 @@ function saveState(state: State): void {
 }
 
 function persistUrlsState(urls: string[], activeUrl: string): void {
-    saveState({model: ollama.getModel(), thinking: ollama.isThinking(), contextSize: ollama.getNumCtx(), urls, activeUrl});
+    saveState({model: ollama.getModel(), thinking: ollama.isThinking(), contextSize: ollama.getNumCtx(), urls, activeUrl, apiKey: ollama.getApiKey()});
 }
 
 function ensureUrls(state: State): string[] {
@@ -163,7 +165,7 @@ function getActiveUrl(state: State): string {
 const savedState = loadState();
 const initialUrls = ensureUrls(savedState);
 const initialActiveUrl = getActiveUrl(savedState);
-const ollama = new OllamaClient(initialActiveUrl, savedState.model, savedState.thinking, savedState.contextSize);
+const ollama = new OllamaClient(initialActiveUrl, savedState.model, savedState.thinking, savedState.contextSize, savedState.apiKey);
 
 type Mode = "agent" | "plan";
 
@@ -692,10 +694,55 @@ async function runAgentTurn(session: Session, client: acp.AgentContext, userText
     return "max_turn_requests";
 }
 
-const input = Writable.toWeb(process.stdout) as unknown as WritableStream<Uint8Array>;
-const output = Readable.toWeb(process.stdin) as unknown as ReadableStream<Uint8Array>;
-const stream = ndJsonStream(input, output);
 const app = acp.agent({name: AGENT_NAME});
+
+async function applySetup(url: string, apiKey: string): Promise<void> {
+    const state = loadState();
+    const normalized = normalizeUrl(url) || DEFAULT_URL;
+    const urls = state.urls && state.urls.length > 0 ? state.urls : [DEFAULT_URL];
+    if (!urls.includes(normalized)) urls.push(normalized);
+
+    const cleanedApiKey = apiKey.trim() || undefined;
+    const newState: State = {
+        model: state.model,
+        thinking: state.thinking,
+        contextSize: state.contextSize,
+        urls,
+        activeUrl: normalized,
+        apiKey: cleanedApiKey
+    };
+    saveState(newState);
+
+    process.stderr.write(`\nSaved to ${STATE_FILE}\n`);
+    process.stderr.write(`  URL: ${normalized}\n`);
+    process.stderr.write(`  API key: ${cleanedApiKey ? "(set)" : "(none)"}\n`);
+    process.stderr.write("\nSetup complete. You can now use this agent with your IDE.\n\n");
+}
+
+async function runSetup(): Promise<void> {
+    process.stderr.write("\n=== Ollama ACP — Setup ===\n\n");
+
+    if (process.stdin.isTTY) {
+        const rl = readline.createInterface({input: process.stdin, output: process.stderr});
+        try {
+            const question = (q: string): Promise<string> => new Promise(resolve => rl.question(q, resolve));
+            const url = await question(`Ollama server URL [${DEFAULT_URL}]: `);
+            const apiKey = await question("API key (leave empty for local Ollama, no auth): ");
+            await applySetup(url, apiKey);
+        } finally {
+            rl.close();
+        }
+        return;
+    }
+
+    const chunks: Buffer[] = [];
+    for await (const chunk of process.stdin) chunks.push(chunk);
+    const input = Buffer.concat(chunks).toString("utf-8");
+    const lines = input.split("\n");
+    const url = lines[0]?.trim() ?? "";
+    const apiKey = lines[1]?.trim() ?? "";
+    await applySetup(url, apiKey);
+}
 
 app.onRequest("initialize", (ctx: any) => {
     log("initialize", "client:", JSON.stringify(ctx.params?.clientInfo));
@@ -708,7 +755,13 @@ app.onRequest("initialize", (ctx: any) => {
             loadSession: false,
             promptCapabilities: {image: false, audio: false, embeddedContext: true}
         },
-        authMethods: []
+        authMethods: [{
+            id: "ollama-acp-setup",
+            name: "Set up Ollama connection",
+            description: "Run an interactive setup to configure the Ollama server URL and an optional API key for authenticated/remote servers.",
+            type: "terminal",
+            args: ["--setup"]
+        }]
     };
 });
 
@@ -741,7 +794,8 @@ async function configOptions(models: string[] = []): Promise<any[]> {
             thinking: false,
             contextSize: ollama.getNumCtx(),
             urls: currentUrls(),
-            activeUrl: currentActiveUrl()
+            activeUrl: currentActiveUrl(),
+            apiKey: ollama.getApiKey()
         });
     }
 
@@ -851,17 +905,17 @@ app.onRequest("session/set_config_option", async (ctx: any) => {
                 ollama.setThinking(false);
             }
         } catch {}
-        saveState({model: ctx.params.value, thinking, contextSize: ollama.getNumCtx(), urls: currentUrls(), activeUrl: currentActiveUrl()});
+        saveState({model: ctx.params.value, thinking, contextSize: ollama.getNumCtx(), urls: currentUrls(), activeUrl: currentActiveUrl(), apiKey: ollama.getApiKey()});
     }
     if (ctx.params.configId === "ollama_thinking" && typeof ctx.params.value === "string") {
         const thinking = ctx.params.value === "true";
         ollama.setThinking(thinking);
-        saveState({model: ollama.getModel(), thinking, urls: currentUrls(), activeUrl: currentActiveUrl()});
+        saveState({model: ollama.getModel(), thinking, urls: currentUrls(), activeUrl: currentActiveUrl(), apiKey: ollama.getApiKey()});
     }
     if (ctx.params.configId === "ollama_context_size" && typeof ctx.params.value === "string") {
         const contextSize = Number(ctx.params.value);
         ollama.setNumCtx(contextSize);
-        saveState({model: ollama.getModel(), thinking: ollama.isThinking(), contextSize, urls: currentUrls(), activeUrl: currentActiveUrl()});
+        saveState({model: ollama.getModel(), thinking: ollama.isThinking(), contextSize, urls: currentUrls(), activeUrl: currentActiveUrl(), apiKey: ollama.getApiKey()});
     }
     const models = await ollama.listModels().catch((err) => { log("listModels failed on config change:", err); return []; });
     log("set_config_option models:", JSON.stringify(models));
@@ -903,4 +957,14 @@ app.onNotification("session/cancel", (ctx: any) => {
     sessions.get(ctx.params.sessionId)?.abort?.abort();
 });
 
-app.connect(stream);
+if (process.argv.includes("--setup")) {
+    runSetup().then(() => process.exit(0)).catch(err => {
+        process.stderr.write(`Setup failed: ${err instanceof Error ? err.message : err}\n`);
+        process.exit(1);
+    });
+} else {
+    const input = Writable.toWeb(process.stdout) as unknown as WritableStream<Uint8Array>;
+    const output = Readable.toWeb(process.stdin) as unknown as ReadableStream<Uint8Array>;
+    const stream = ndJsonStream(input, output);
+    app.connect(stream);
+}
