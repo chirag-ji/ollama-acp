@@ -674,7 +674,9 @@ app.onRequest("session/set_config_option", async (ctx: any) => {
     }
     const models = await ollama.listModels().catch((err) => { log("listModels failed on config change:", err); return []; });
     log("set_config_option models:", JSON.stringify(models));
-    return {configOptions: await configOptions(models)};
+    const opts = await configOptions(models);
+    await emitConfigUpdate(ctx.client, ctx.params.sessionId, models);
+    return {configOptions: opts};
 });
 
 app.onRequest("session/set_mode", (ctx: any) => {
