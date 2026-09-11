@@ -287,9 +287,51 @@ type Session = {
     mode: Mode;
     messages: OllamaMessage[];
     abort?: AbortController;
+    client?: acp.AgentContext;
 };
 
 const sessions = new Map<string, Session>();
+
+const HEALTH_POLL_INTERVAL_MS = 4000;
+let healthMonitorStarted = false;
+
+function startHealthMonitor(): void {
+    if (healthMonitorStarted) return;
+    healthMonitorStarted = true;
+    setInterval(async () => {
+        if (ollama.isReachable()) return;
+        const ok = await ollama.probe();
+        if (!ok) return;
+        log("connection", "server reachable again at", ollama.getBaseUrl());
+        ollama.invalidateCapabilities();
+        for (const session of sessions.values()) {
+            if (!session.client) continue;
+            try {
+                await emitConfigUpdate(session.client, session.id);
+            } catch (err) {
+                log("health monitor emitConfigUpdate failed:", err);
+            }
+        }
+    }, HEALTH_POLL_INTERVAL_MS).unref();
+}
+
+async function retryConnection(): Promise<boolean> {
+    const ok = await ollama.probe();
+    log("connection", "retry:", ok ? "reachable" : "still unreachable", "error:", ollama.getHealth().error ?? "(none)");
+    if (ok) {
+        ollama.invalidateCapabilities();
+    }
+    return ok;
+}
+
+async function probeAndBroadcast(client: acp.AgentContext, sessionId: string): Promise<void> {
+    const ok = await ollama.probe();
+    if (ok) {
+        ollama.invalidateCapabilities();
+        await ollama.listModels().catch((err) => { log("probeAndBroadcast listModels failed:", err); return []; });
+    }
+    await emitConfigUpdate(client, sessionId);
+}
 
 function localExec(command: string, args: string[], cwd: string): Promise<string> {
     return new Promise((resolve) => {
@@ -770,9 +812,13 @@ async function runAgentTurn(session: Session, client: acp.AgentContext, userText
             const msg = err instanceof Error ? err.message : String(err);
             log("ollama.chat error", session.id, msg);
             session.messages.push({role: "system", content: `The previous model call failed: ${msg}`});
+            const health = ollama.getHealth();
+            const errorText = health.ok
+                ? `[Ollama error] ${msg}`
+                : `[Ollama error] ${msg}\nOllama server ${health.url} is unreachable. Start Ollama, then open the agent's Connection setting and pick "Retry connection" — or just send another message; the agent will retry automatically.`;
             await emitUpdate(client, session.id, {
                 sessionUpdate: "agent_message_chunk",
-                content: {type: "text", text: `[Ollama error] ${msg}`}
+                content: {type: "text", text: errorText}
             });
             return finish("end_turn");
         }
@@ -1004,6 +1050,33 @@ function currentActiveUrl(): string {
     return getActiveUrl(loadState());
 }
 
+function connectionConfigOption(): any {
+    const health = ollama.getHealth();
+    if (health.ok) {
+        return {
+            id: "ollama_connection",
+            type: "select",
+            name: "Connection",
+            description: `Ollama server ${health.url} is online.`,
+            category: "_connection",
+            currentValue: "online",
+            options: [{value: "online", name: "Online"}]
+        };
+    }
+    return {
+        id: "ollama_connection",
+        type: "select",
+        name: "Connection",
+        description: `Ollama server ${health.url} is unreachable.${health.error ? ` Last error: ${health.error}` : ""} Start Ollama, then pick "Retry connection" — no IDE restart needed.`,
+        category: "_connection",
+        currentValue: "offline",
+        options: [
+            {value: "offline", name: "Offline"},
+            {value: "retry_now", name: "Retry connection"}
+        ]
+    };
+}
+
 async function configOptions(models: string[] = []): Promise<any[]> {
     const currentModel = ollama.getModel();
     const allModels = Array.from(new Set([currentModel, ...models]));
@@ -1059,6 +1132,7 @@ async function configOptions(models: string[] = []): Promise<any[]> {
                 {value: ADD_URL_OPTION, name: "Add new URL..."}
             ]
         },
+        ...connectionConfigOption(),
         {
             id: "ollama_thinking",
             type: "select",
@@ -1093,7 +1167,8 @@ app.onRequest("session/new", async (ctx: any) => {
         id,
         cwd: ctx.params.cwd,
         mode: "agent",
-        messages: []
+        messages: [],
+        client: ctx.client
     };
     sessions.set(id, session);
     return {
@@ -1124,6 +1199,10 @@ app.onRequest("session/set_config_option", async (ctx: any) => {
             ollama.invalidateCapabilities();
             persistUrlsState(urls, ctx.params.value);
         }
+        void probeAndBroadcast(ctx.client, ctx.params.sessionId);
+    }
+    if (ctx.params.configId === "ollama_connection" && ctx.params.value === "retry_now") {
+        await retryConnection();
     }
     if (ctx.params.configId === "ollama_model" && typeof ctx.params.value === "string") {
         ollama.setModel(ctx.params.value);
@@ -1204,6 +1283,7 @@ if (isMain) {
         process.exit(0);
     } else {
         initLifecycle();
+        startHealthMonitor();
         const input = Writable.toWeb(process.stdout) as unknown as WritableStream<Uint8Array>;
         const output = Readable.toWeb(process.stdin) as unknown as ReadableStream<Uint8Array>;
         const stream = ndJsonStream(input, output);

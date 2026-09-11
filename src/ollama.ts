@@ -55,6 +55,13 @@ export type ModelCapabilities = {
   details?: Record<string, unknown>;
 };
 
+export type ServerHealth = {
+  ok: boolean;
+  url: string;
+  error?: string;
+  checkedAt?: string;
+};
+
 function authErrorHint(status: number): string {
     if (status === 401 || status === 403) {
         return "Server rejected authentication. Run 'ollama-acp --setup' to configure an API key, or unset OLLAMA_API_KEY for a local Ollama server that requires no auth.";
@@ -69,6 +76,10 @@ export class OllamaClient {
   private numCtx: number;
   private apiKey?: string;
   private cachedCapabilities: Map<string, ModelCapabilities> = new Map();
+  private reachable: boolean = true;
+  private lastError?: string;
+  private lastCheckedAt?: string;
+  private lastModels: string[] = [];
 
   constructor(
     baseUrl?: string,
@@ -87,6 +98,46 @@ export class OllamaClient {
   getApiKey(): string | undefined { return this.apiKey; }
 
   setApiKey(apiKey: string | undefined): void { this.apiKey = apiKey; }
+
+  isReachable(): boolean { return this.reachable; }
+
+  getHealth(): ServerHealth {
+    return {
+      ok: this.reachable,
+      url: this.baseUrl,
+      error: this.lastError,
+      checkedAt: this.lastCheckedAt
+    };
+  }
+
+  private recordFailure(err: unknown): void {
+    if (err instanceof Error && err.name === "AbortError") return;
+    this.reachable = false;
+    this.lastError = err instanceof Error ? err.message : String(err);
+    this.lastCheckedAt = new Date().toISOString();
+  }
+
+  private recordSuccess(): void {
+    this.reachable = true;
+    this.lastError = undefined;
+    this.lastCheckedAt = new Date().toISOString();
+  }
+
+  async probe(timeoutMs = 3000): Promise<boolean> {
+    try {
+      const res = await fetch(`${this.baseUrl}/api/tags`, {
+        headers: this.headers(),
+        signal: AbortSignal.timeout(timeoutMs)
+      });
+      const json = await res.json() as { models?: Array<{ name: string }> };
+      this.lastModels = (json.models ?? []).map(m => m.name);
+      this.recordSuccess();
+      return true;
+    } catch (err) {
+      this.recordFailure(err);
+      return false;
+    }
+  }
 
   private headers(): Record<string, string> {
     const h: Record<string, string> = {"content-type": "application/json"};
@@ -115,11 +166,18 @@ export class OllamaClient {
     const cached = this.cachedCapabilities.get(target);
     if (cached) return cached;
 
-    const res = await fetch(`${this.baseUrl}/api/show`, {
-      method: "POST",
-      headers: this.headers(),
-      body: JSON.stringify({model: target})
-    });
+    let res: Response;
+    try {
+      res = await fetch(`${this.baseUrl}/api/show`, {
+        method: "POST",
+        headers: this.headers(),
+        body: JSON.stringify({model: target})
+      });
+    } catch (err) {
+      this.recordFailure(err);
+      throw err;
+    }
+    this.recordSuccess();
     if (!res.ok) throw new Error(`Ollama /api/show failed: ${res.status}. ${authErrorHint(res.status)}`);
     const json = await res.json() as {
       capabilities?: string[];
@@ -141,30 +199,47 @@ export class OllamaClient {
   }
 
   async listModels(): Promise<string[]> {
-    const res = await fetch(`${this.baseUrl}/api/tags`, {
-      headers: this.headers()
-    });
+    let res: Response;
+    try {
+      res = await fetch(`${this.baseUrl}/api/tags`, {
+        headers: this.headers()
+      });
+    } catch (err) {
+      this.recordFailure(err);
+      log(`listModels: server unreachable, returning ${this.lastModels.length} cached model names`);
+      return this.lastModels;
+    }
+    this.recordSuccess();
     if (!res.ok) throw new Error(`Ollama /api/tags failed: ${res.status}. ${authErrorHint(res.status)}`);
     const json = await res.json() as { models?: Array<{ name: string }> };
     const names = (json.models ?? []).map(m => m.name);
+    this.lastModels = names;
     log(`listModels: got ${names.length} models: ${JSON.stringify(names)}`);
     return names;
   }
 
   private async postChat(messages: OllamaMessage[], tools: OllamaTool[], think: boolean, signal?: AbortSignal): Promise<Response> {
-    return fetch(`${this.baseUrl}/api/chat`, {
-      method: "POST",
-      headers: this.headers(),
-      body: JSON.stringify({
-        model: this.model,
-        messages,
-        tools,
-        stream: true,
-        think,
-        options: {num_ctx: this.numCtx}
-      }),
-      signal
-    });
+    let res: Response;
+    try {
+      res = await fetch(`${this.baseUrl}/api/chat`, {
+        method: "POST",
+        headers: this.headers(),
+        body: JSON.stringify({
+          model: this.model,
+          messages,
+          tools,
+          stream: true,
+          think,
+          options: {num_ctx: this.numCtx}
+        }),
+        signal
+      });
+    } catch (err) {
+      this.recordFailure(err);
+      throw err;
+    }
+    this.recordSuccess();
+    return res;
   }
 
   private async readChatStream(
