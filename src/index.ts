@@ -69,6 +69,10 @@ const CONTEXT_SIZES = [4096, 8192, 16384, 32768, 65536, 131072];
 const DEFAULT_URL = "http://127.0.0.1:11434";
 const ADD_URL_OPTION = "__acp_add_url__";
 
+const CONTEXT_COMPRESSION_THRESHOLD = 0.8;
+const MIN_MESSAGES_BEFORE_COMPRESS = 12;
+const KEEP_RECENT_MESSAGES = 8;
+
 let supportsElicitationForm = false;
 let clientName = "unknown";
 
@@ -207,6 +211,97 @@ export function mergeFileChanges(snapshotChanges: FileChange[], tracker: FileCha
     return [...byPath.values()];
 }
 
+export function estimateMessagesTokens(messages: OllamaMessage[]): number {
+    let chars = 0;
+    for (const m of messages) {
+        chars += m.content?.length ?? 0;
+        for (const tc of m.tool_calls ?? []) {
+            chars += JSON.stringify(tc.function.arguments ?? {}).length;
+        }
+    }
+    return Math.ceil(chars / 4);
+}
+
+export function shouldCompressMessages(messages: OllamaMessage[], numCtx: number, lastPromptTokens?: number): boolean {
+    if (messages.length < MIN_MESSAGES_BEFORE_COMPRESS) return false;
+    const tokens = lastPromptTokens ?? estimateMessagesTokens(messages);
+    return tokens > Math.floor(numCtx * CONTEXT_COMPRESSION_THRESHOLD);
+}
+
+export function compressMessages(messages: OllamaMessage[], summary: string, keepRecent: number = KEEP_RECENT_MESSAGES): OllamaMessage[] {
+    const trimmed = (summary ?? "").trim();
+    if (!trimmed || messages.length === 0) return messages;
+    const keep = Math.min(keepRecent, Math.max(0, messages.length - 2));
+    const cut = messages.length - keep;
+    if (cut <= 1) return messages;
+    const system = messages[0];
+    const recent = messages.slice(cut);
+    return [
+        system,
+        {role: "system", content: `[Summary of earlier conversation]\n${trimmed}`},
+        ...recent
+    ];
+}
+
+function renderMessagesForSummary(msgs: OllamaMessage[]): string {
+    return msgs.map((m) => {
+        if (m.role === "tool") {
+            return `[tool result${m.tool_name ? ` for ${m.tool_name}` : ""}]\n${m.content ?? ""}`;
+        }
+        const content = m.content ?? "";
+        const calls = m.tool_calls?.length
+            ? `\n[tool calls] ${m.tool_calls.map(tc => `${tc.function.name}(${JSON.stringify(tc.function.arguments ?? {})})`).join("; ")}`
+            : "";
+        return `[${m.role}]\n${content}${calls}`.trim();
+    }).join("\n\n---\n\n");
+}
+
+const SUMMARIZE_SYSTEM = "You are the context-compaction assistant for a coding agent. A user and a coding agent have been working together, and the conversation must be compressed so work can continue inside a smaller context window.\n\nProduce a concise but information-dense summary that preserves:\n- the user's overall goal and the current task\n- what has already been done and any decisions made\n- important codebase facts: file paths, symbols, configs, and command outputs that still matter\n- errors, failed attempts, and why they failed\n- open questions and the next step to take\n\nDo not quote tool calls verbatim. Do not add commentary or a preamble. Output only the summary text.";
+
+async function summarizeMessages(msgs: OllamaMessage[], signal?: AbortSignal): Promise<string> {
+    const segmentBudget = Math.max(1024, Math.floor(ollama.getNumCtx() * 0.5));
+    const segments: OllamaMessage[][] = [];
+    let current: OllamaMessage[] = [];
+    let currentTokens = 0;
+    for (const m of msgs) {
+        const tokens = estimateMessagesTokens([m]) + 8;
+        if (current.length && currentTokens + tokens > segmentBudget) {
+            segments.push(current);
+            current = [];
+            currentTokens = 0;
+        }
+        current.push(m);
+        currentTokens += tokens;
+    }
+    if (current.length) segments.push(current);
+
+    let rolling = "";
+    for (const segment of segments) {
+        const body = rolling
+            ? `Previous summary:\n${rolling}\n\nNext part of the conversation to fold in:\n${renderMessagesForSummary(segment)}`
+            : renderMessagesForSummary(segment);
+        const prompt: OllamaMessage[] = [
+            {role: "system", content: SUMMARIZE_SYSTEM},
+            {role: "user", content: body}
+        ];
+        const next = (await ollama.summarize(prompt, signal)).trim();
+        if (!next) return "";
+        rolling = next;
+    }
+    return rolling;
+}
+
+async function compressContext(session: Session, signal?: AbortSignal): Promise<boolean> {
+    const cut = Math.max(1, session.messages.length - KEEP_RECENT_MESSAGES);
+    if (cut <= 1) return false;
+    const older = session.messages.slice(1, cut);
+    const summary = await summarizeMessages(older, signal);
+    session.messages = compressMessages(session.messages, summary, KEEP_RECENT_MESSAGES);
+    session.lastPromptTokens = undefined;
+    log("context compressed", session.id, "messages:", older.length, "->", 1, "summary tokens ~", estimateMessagesTokens([{role: "system", content: summary || ""}]));
+    return summary.trim().length > 0;
+}
+
 async function emitFileChangesSummary(
     client: acp.AgentContext,
     sessionId: string,
@@ -288,6 +383,8 @@ type Session = {
     messages: OllamaMessage[];
     abort?: AbortController;
     client?: acp.AgentContext;
+    lastPromptTokens?: number;
+    compactedTurn?: boolean;
 };
 
 const sessions = new Map<string, Session>();
@@ -773,6 +870,7 @@ async function runAgentTurn(session: Session, client: acp.AgentContext, userText
 
     if (session.messages.length === 0) session.messages.push({role: "system", content: system});
     session.messages.push({role: "user", content: userText});
+    session.compactedTurn = false;
 
     const before = snapshotFiles(session.cwd);
     const tracker: FileChangeTracker = new Map();
@@ -789,6 +887,19 @@ async function runAgentTurn(session: Session, client: acp.AgentContext, userText
             sessionUpdate: "agent_thought_chunk",
             content: {type: "text", text: `Step ${step + 1}: reasoning about the next action…`}
         });
+
+        if (!session.compactedTurn) {
+            const numCtx = ollama.getNumCtx();
+            if (shouldCompressMessages(session.messages, numCtx, session.lastPromptTokens)) {
+                log("context compression triggered", session.id, "numCtx:", numCtx, "lastPromptTokens:", session.lastPromptTokens ?? "unknown");
+                await emitUpdate(client, session.id, {
+                    sessionUpdate: "agent_thought_chunk",
+                    content: {type: "text", text: "The conversation is approaching the model's context window. Summarizing the earlier part of the conversation so we can keep going."}
+                });
+                const ok = await compressContext(session, session.abort?.signal);
+                if (ok) session.compactedTurn = true;
+            }
+        }
 
         let response: OllamaResponse;
         try {
@@ -823,6 +934,7 @@ async function runAgentTurn(session: Session, client: acp.AgentContext, userText
             return finish("end_turn");
         }
         const assistant = response.message;
+        session.lastPromptTokens = response.prompt_eval_count;
         log("ollama response", session.id, "step:", step + 1, "tool_calls:", assistant.tool_calls?.length ?? 0, "content:", (assistant.content ?? "").slice(0, 200));
         session.messages.push({
             role: "assistant",
@@ -1132,7 +1244,7 @@ async function configOptions(models: string[] = []): Promise<any[]> {
                 {value: ADD_URL_OPTION, name: "Add new URL..."}
             ]
         },
-        ...connectionConfigOption(),
+        ...[connectionConfigOption()],
         {
             id: "ollama_thinking",
             type: "select",

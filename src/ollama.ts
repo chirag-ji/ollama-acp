@@ -23,6 +23,7 @@ export type OllamaChunk = {
     thinking?: string;
     tool_calls?: OllamaToolCall[];
   };
+  prompt_eval_count?: number;
   done?: boolean;
   done_reason?: string;
 };
@@ -35,6 +36,7 @@ export type OllamaResponse = {
     tool_calls?: OllamaToolCall[];
   };
   done: boolean;
+  prompt_eval_count?: number;
 };
 
 function log(...args: unknown[]): void {
@@ -242,6 +244,34 @@ export class OllamaClient {
     return res;
   }
 
+  async summarize(messages: OllamaMessage[], signal?: AbortSignal): Promise<string> {
+    let res: Response;
+    try {
+      res = await fetch(`${this.baseUrl}/api/chat`, {
+        method: "POST",
+        headers: this.headers(),
+        body: JSON.stringify({
+          model: this.model,
+          messages,
+          stream: false,
+          think: false,
+          options: {num_ctx: this.numCtx, num_predict: 2048}
+        }),
+        signal
+      });
+    } catch (err) {
+      this.recordFailure(err);
+      throw err;
+    }
+    this.recordSuccess();
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`Ollama /api/chat (summarize) failed: ${res.status} ${body} ${authErrorHint(res.status)}`);
+    }
+    const json = await res.json() as { message?: { content?: string } };
+    return json.message?.content ?? "";
+  }
+
   private async readChatStream(
     res: Response,
     onChunk?: (chunk: OllamaChunk) => void | Promise<void>,
@@ -254,6 +284,7 @@ export class OllamaClient {
     let content = "";
     let thinking = "";
     let toolCalls: OllamaToolCall[] = [];
+    let promptEvalCount: number | undefined;
 
     const processLine = async (line: string): Promise<void> => {
       const trimmed = line.trim();
@@ -267,6 +298,7 @@ export class OllamaClient {
       if (chunk.message?.content) content += chunk.message.content;
       if (chunk.message?.thinking) thinking += chunk.message.thinking;
       if (chunk.message?.tool_calls?.length) toolCalls = chunk.message.tool_calls;
+      if (typeof chunk.prompt_eval_count === "number") promptEvalCount = chunk.prompt_eval_count;
       if (onChunk) {
         try {
           await onChunk(chunk);
@@ -302,7 +334,8 @@ export class OllamaClient {
         thinking: thinking || undefined,
         tool_calls: toolCalls.length ? toolCalls : undefined
       },
-      done: true
+      done: true,
+      prompt_eval_count: promptEvalCount
     };
   }
 
