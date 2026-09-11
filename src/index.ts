@@ -385,6 +385,7 @@ type Session = {
     client?: acp.AgentContext;
     lastPromptTokens?: number;
     compactedTurn?: boolean;
+    permissionMode: {edit: "prompt" | "allow" | "deny"; execute: "prompt" | "allow" | "deny"};
 };
 
 const sessions = new Map<string, Session>();
@@ -679,7 +680,7 @@ async function requestPermission(
     title: string,
     kind: "edit" | "execute",
     location?: string
-): Promise<boolean> {
+): Promise<{allowed: boolean; remember: "allow" | "deny" | undefined}> {
     const result = await client.request(acp.methods.client.session.requestPermission, {
         sessionId,
         toolCall: {
@@ -691,10 +692,29 @@ async function requestPermission(
         },
         options: [
             {optionId: "allow_once", kind: "allow_once", name: "Allow once"},
-            {optionId: "reject_once", kind: "reject_once", name: "Reject"}
+            {optionId: "allow_always", kind: "allow_always", name: "Allow always"},
+            {optionId: "reject_once", kind: "reject_once", name: "Reject"},
+            {optionId: "reject_always", kind: "reject_always", name: "Reject always"}
         ]
     });
-    return result.outcome.outcome !== "cancelled" && result.outcome.optionId === "allow_once";
+    if (result.outcome.outcome === "cancelled") return {allowed: false, remember: undefined};
+    switch (result.outcome.optionId) {
+        case "allow_always":
+            return {allowed: true, remember: "allow"};
+        case "reject_always":
+            return {allowed: false, remember: "deny"};
+        case "allow_once":
+            return {allowed: true, remember: undefined};
+        default:
+            return {allowed: false, remember: undefined};
+    }
+}
+
+function permissionCheck(session: Session, kind: "edit" | "execute"): "allowed" | "denied" | "ask" {
+    const mode = session.permissionMode[kind];
+    if (mode === "allow") return "allowed";
+    if (mode === "deny") return "denied";
+    return "ask";
 }
 
 async function executeTool(
@@ -721,8 +741,14 @@ async function executeTool(
         const content = String(args.content);
         const abs = isAbsolute(path) ? path : join(session.cwd, path);
         const existed = existsSync(abs);
-        const allowed = await requestPermission(client, sessionId, `Write ${path}`, "edit", path);
-        if (!allowed) return "DENIED by user.";
+        const check = permissionCheck(session, "edit");
+        if (check === "denied") return "DENIED by user.";
+        if (check === "ask") {
+            const outcome = await requestPermission(client, sessionId, `Write ${path}`, "edit", path);
+            if (outcome.remember === "deny") session.permissionMode.edit = "deny";
+            if (outcome.remember === "allow") session.permissionMode.edit = "allow";
+            if (!outcome.allowed) return "DENIED by user.";
+        }
         await client.request(acp.methods.client.fs.writeTextFile, {sessionId, path, content});
         if (tracker && !tracker.has(abs)) tracker.set(abs, {path: abs, kind: existed ? "modified" : "created"});
         return `Wrote ${path}`;
@@ -740,8 +766,14 @@ async function executeTool(
         }
 
         if (session.mode === "agent") {
-            const allowed = await requestPermission(client, sessionId, `Run: ${command} ${rawArgs.join(" ")}`, "execute");
-            if (!allowed) return "DENIED by user.";
+            const check = permissionCheck(session, "execute");
+            if (check === "denied") return "DENIED by user.";
+            if (check === "ask") {
+                const outcome = await requestPermission(client, sessionId, `Run: ${command} ${rawArgs.join(" ")}`, "execute");
+                if (outcome.remember === "deny") session.permissionMode.execute = "deny";
+                if (outcome.remember === "allow") session.permissionMode.execute = "allow";
+                if (!outcome.allowed) return "DENIED by user.";
+            }
         }
 
         try {
@@ -1280,6 +1312,7 @@ app.onRequest("session/new", async (ctx: any) => {
         cwd: ctx.params.cwd,
         mode: "agent",
         messages: [],
+        permissionMode: {edit: "prompt", execute: "prompt"},
         client: ctx.client
     };
     sessions.set(id, session);

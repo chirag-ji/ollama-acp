@@ -297,7 +297,19 @@ export class OllamaClient {
       }
       if (chunk.message?.content) content += chunk.message.content;
       if (chunk.message?.thinking) thinking += chunk.message.thinking;
-      if (chunk.message?.tool_calls?.length) toolCalls = chunk.message.tool_calls;
+      if (chunk.message?.tool_calls?.length) {
+        const incoming = chunk.message.tool_calls;
+        const merged = [...toolCalls];
+        for (const tc of incoming) {
+          const idx = merged.findIndex(m => m.function.name === tc.function.name);
+          if (idx >= 0) {
+            merged[idx] = tc;
+          } else {
+            merged.push(tc);
+          }
+        }
+        toolCalls = merged;
+      }
       if (typeof chunk.prompt_eval_count === "number") promptEvalCount = chunk.prompt_eval_count;
       if (onChunk) {
         try {
