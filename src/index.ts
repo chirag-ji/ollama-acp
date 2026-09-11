@@ -469,11 +469,28 @@ const TOOLS: OllamaTool[] = [
         type: "function",
         function: {
             name: "write_file",
-            description: "Create or replace a text file in the IntelliJ workspace. Use absolute paths.",
+            description: "Create or replace a text file in the IntelliJ workspace. Use absolute paths. Prefer edit_file for small changes to existing files.",
             parameters: {
                 type: "object",
                 required: ["path", "content"],
                 properties: {path: {type: "string"}, content: {type: "string"}}
+            }
+        }
+    },
+    {
+        type: "function",
+        function: {
+            name: "edit_file",
+            description: "Apply a targeted edit to an existing file. Provide the exact old_string to find and the new_string to replace it with. old_string must match exactly (including whitespace and indentation). Prefer this over write_file when modifying existing files — it uses fewer tokens and avoids accidental changes.",
+            parameters: {
+                type: "object",
+                required: ["path", "old_string", "new_string"],
+                properties: {
+                    path: {type: "string"},
+                    old_string: {type: "string", description: "The exact text to find and replace (must match file content exactly)"},
+                    new_string: {type: "string", description: "The replacement text"},
+                    all: {type: "boolean", description: "If true, replace all occurrences. Default: false (error if multiple matches)."}
+                }
             }
         }
     },
@@ -754,6 +771,39 @@ async function executeTool(
         return `Wrote ${path}`;
     }
 
+    if (name === "edit_file") {
+        if (session.mode === "plan") return "DENIED: plan mode is read-only.";
+        const path = String(args.path);
+        const oldString = String(args.old_string);
+        const newString = String(args.new_string);
+        const replaceAll = args.all === true;
+        if (!oldString) return "Error: old_string cannot be empty.";
+        const abs = isAbsolute(path) ? path : join(session.cwd, path);
+        if (!existsSync(abs)) return `Error: file not found: ${path}`;
+        const check = permissionCheck(session, "edit");
+        if (check === "denied") return "DENIED by user.";
+        if (check === "ask") {
+            const outcome = await requestPermission(client, sessionId, `Edit ${path}`, "edit", path);
+            if (outcome.remember === "deny") session.permissionMode.edit = "deny";
+            if (outcome.remember === "allow") session.permissionMode.edit = "allow";
+            if (!outcome.allowed) return "DENIED by user.";
+        }
+        const response = await client.request(acp.methods.client.fs.readTextFile, {sessionId, path});
+        const content: string = response.content;
+        let count = 0;
+        let idx = 0;
+        while ((idx = content.indexOf(oldString, idx)) !== -1) {
+            count++;
+            idx += oldString.length;
+        }
+        if (count === 0) return `Error: old_string not found in ${path}. Make sure it matches the file content exactly (including whitespace and indentation).`;
+        if (count > 1 && !replaceAll) return `Error: old_string found ${count} times in ${path}. Provide a longer unique string, or set all=true to replace all occurrences.`;
+        const updated = replaceAll ? content.split(oldString).join(newString) : content.replace(oldString, newString);
+        await client.request(acp.methods.client.fs.writeTextFile, {sessionId, path, content: updated});
+        if (tracker && !tracker.has(abs)) tracker.set(abs, {path: abs, kind: "modified"});
+        return `Edited ${path} (${count} occurrence${count > 1 ? "s" : ""} replaced)`;
+    }
+
     if (name === "run_command") {
         const command = String(args.command);
         const rawArgs = Array.isArray(args.args) ? args.args.map(String) : [];
@@ -895,6 +945,7 @@ async function runAgentTurn(session: Session, client: acp.AgentContext, userText
             : "AGENT MODE: autonomously work toward the user's goal. Inspect first, make focused edits, run relevant checks, fix failures, and summarize the result.",
         "CRITICAL WORKFLOW: Before making any changes, explore the workspace thoroughly. Use list_directory and search_files to understand the project structure. Use search_content to find all usages of functions/classes you plan to modify. Use read_file to read related files that might need updates. Never assume file contents — always read them first.",
         "When modifying a file, check for imports, usages, tests, and related code that may also need changes. Use search_content to find all references before editing.",
+        "EDITING RULES: To change an existing file, use edit_file with the exact old_string you want to replace and the replacement new_string. This avoids rewriting the whole file. old_string must match the file exactly — copy it from what you read, including indentation. If old_string appears more than once, make it longer until unique, or set all=true. Use write_file only to create a new file or to replace an entire file's content.",
         "Prefer small, verifiable changes. Never invent file contents when you can read them.",
         "Use tools instead of merely telling the user what they could do.",
         "URL management: the \"Ollama URL\" dropdown in the IDE config UI has an \"Add new URL...\" entry that lets the user type a new server URL directly. You can also use list_urls to show saved URLs, add_url to add a server URL, remove_url to remove one. When the user asks to connect/switch to an Ollama server or mentions a URL, prefer list_urls/add_url."
@@ -984,7 +1035,7 @@ async function runAgentTurn(session: Session, client: acp.AgentContext, userText
                 sessionUpdate: "tool_call",
                 toolCallId: id,
                 title,
-                kind: call.function.name === "read_file" || call.function.name === "list_urls" || call.function.name === "list_directory" || call.function.name === "search_files" || call.function.name === "search_content" ? "read" : call.function.name === "write_file" || call.function.name === "add_url" || call.function.name === "remove_url" ? "edit" : "execute",
+                kind: call.function.name === "read_file" || call.function.name === "list_urls" || call.function.name === "list_directory" || call.function.name === "search_files" || call.function.name === "search_content" ? "read" : call.function.name === "write_file" || call.function.name === "edit_file" || call.function.name === "add_url" || call.function.name === "remove_url" ? "edit" : "execute",
                 status: "in_progress",
                 rawInput: call.function.arguments
             });
