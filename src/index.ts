@@ -374,6 +374,28 @@ const initialUrls = ensureUrls(savedState);
 const initialActiveUrl = getActiveUrl(savedState);
 const ollama = new OllamaClient(initialActiveUrl, savedState.model, savedState.thinking, savedState.contextSize, savedState.apiKey);
 
+const PROGRESS_HEARTBEAT_MS = Math.max(1000, Number(process.env.OLLAMA_PROGRESS_HEARTBEAT_MS ?? 4000));
+
+function startProgressHeartbeat(client: acp.AgentContext, sessionId: string): ReturnType<typeof setInterval> | undefined {
+    const timer = setInterval(async () => {
+        try {
+            await emitUpdate(client, sessionId, {
+                sessionUpdate: "agent_thought_chunk",
+                content: {type: "text", text: ""}
+            });
+        } catch (err) {
+            log("progress heartbeat failed:", err);
+        }
+    }, PROGRESS_HEARTBEAT_MS);
+    timer.unref();
+    return timer;
+}
+
+function stopProgressHeartbeat(timer: ReturnType<typeof setInterval> | undefined): void {
+    if (timer === undefined) return;
+    clearInterval(timer);
+}
+
 type Mode = "agent" | "plan";
 
 type Session = {
@@ -385,6 +407,7 @@ type Session = {
     client?: acp.AgentContext;
     lastPromptTokens?: number;
     compactedTurn?: boolean;
+    progressHeartbeat?: ReturnType<typeof setInterval>;
     permissionMode: {edit: "prompt" | "allow" | "deny"; execute: "prompt" | "allow" | "deny"};
 };
 
@@ -957,7 +980,10 @@ async function runAgentTurn(session: Session, client: acp.AgentContext, userText
 
     const before = snapshotFiles(session.cwd);
     const tracker: FileChangeTracker = new Map();
+    session.progressHeartbeat = startProgressHeartbeat(client, session.id);
     const finish = async (reason: acp.StopReason): Promise<acp.StopReason> => {
+        stopProgressHeartbeat(session.progressHeartbeat);
+        session.progressHeartbeat = undefined;
         await emitFileChangesSummary(client, session.id, session.cwd, tracker, diffSnapshots(before, snapshotFiles(session.cwd)));
         return reason;
     };
@@ -966,9 +992,9 @@ async function runAgentTurn(session: Session, client: acp.AgentContext, userText
     for (let step = 0; step < maxSteps; step++) {
         if (session.abort?.signal.aborted) return finish("cancelled");
 
+        ollama.setThinking(true);
         await emitUpdate(client, session.id, {
             sessionUpdate: "agent_thought_chunk",
-            content: {type: "text", text: `Step ${step + 1}: reasoning about the next action…`}
         });
 
         if (!session.compactedTurn) {
@@ -1454,6 +1480,8 @@ app.onRequest("session/prompt", async (ctx: any) => {
         log("session/prompt error", session.id, err);
         throw err;
     } finally {
+        stopProgressHeartbeat(session.progressHeartbeat);
+        session.progressHeartbeat = undefined;
         session.abort = undefined;
     }
 });
