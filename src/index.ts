@@ -1040,6 +1040,7 @@ async function runAgentTurn(session: Session, client: acp.AgentContext, userText
                 sessionUpdate: "agent_message_chunk",
                 content: {type: "text", text: errorText}
             });
+            if (!health.ok) await emitConfigUpdate(client, session.id);
             return finish("end_turn");
         }
         const assistant = response.message;
@@ -1271,28 +1272,18 @@ function currentActiveUrl(): string {
     return getActiveUrl(loadState());
 }
 
-function connectionConfigOption(): any {
+function connectionConfigOption(): any | undefined {
     const health = ollama.getHealth();
-    if (health.ok) {
-        return {
-            id: "ollama_connection",
-            type: "select",
-            name: "Connection",
-            description: `Ollama server ${health.url} is online.`,
-            category: "_connection",
-            currentValue: "online",
-            options: [{value: "online", name: "Online"}]
-        };
-    }
+    if (health.ok) return undefined;
     return {
         id: "ollama_connection",
         type: "select",
         name: "Connection",
-        description: `Ollama server ${health.url} is unreachable.${health.error ? ` Last error: ${health.error}` : ""} Start Ollama, then pick "Retry connection" — no IDE restart needed.`,
+        description: `⚠ Ollama server ${health.url} is unreachable${health.error ? ` — ${health.error}` : ""}. Start Ollama, then pick "Retry connection", or just send another message; the agent will retry automatically.`,
         category: "_connection",
         currentValue: "offline",
         options: [
-            {value: "offline", name: "Offline"},
+            {value: "offline", name: "⚠ Ollama ACP offline"},
             {value: "retry_now", name: "Retry connection"}
         ]
     };
@@ -1353,7 +1344,7 @@ async function configOptions(models: string[] = []): Promise<any[]> {
                 {value: ADD_URL_OPTION, name: "Add new URL..."}
             ]
         },
-        ...[connectionConfigOption()],
+        ...(connectionConfigOption() ? [connectionConfigOption()] : []),
         {
             id: "ollama_thinking",
             type: "select",
