@@ -55,6 +55,7 @@ export type ModelCapabilities = {
   capabilities: string[];
   template?: string;
   details?: Record<string, unknown>;
+  maxContext?: number;
 };
 
 export type ServerHealth = {
@@ -63,6 +64,15 @@ export type ServerHealth = {
   error?: string;
   checkedAt?: string;
 };
+
+function extractMaxContext(modelInfo?: Record<string, unknown>): number | undefined {
+    if (!modelInfo) return undefined;
+    const lengths = Object.entries(modelInfo)
+        .filter(([key, value]) => key.endsWith(".context_length") && typeof value === "number")
+        .map(([, value]) => value as number);
+    if (lengths.length === 0) return undefined;
+    return lengths.length === 1 ? lengths[0] : Math.max(...lengths);
+}
 
 function authErrorHint(status: number): string {
     if (status === 401 || status === 403) {
@@ -185,11 +195,13 @@ export class OllamaClient {
       capabilities?: string[];
       template?: string;
       details?: Record<string, unknown>;
+      model_info?: Record<string, unknown>;
     };
     const result: ModelCapabilities = {
       capabilities: json.capabilities ?? [],
       template: json.template,
-      details: json.details
+      details: json.details,
+      maxContext: extractMaxContext(json.model_info)
     };
     this.cachedCapabilities.set(target, result);
     return result;

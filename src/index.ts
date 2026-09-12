@@ -66,6 +66,21 @@ function readLastLogLines(n: number): string[] {
 type State = { model?: string; thinking?: boolean; contextSize?: number; urls?: string[]; activeUrl?: string; apiKey?: string };
 
 const CONTEXT_SIZES = [4096, 8192, 16384, 32768, 65536, 131072];
+
+const CONTEXT_SIZE_LABELS: Record<string, string> = {
+    "4096": "Very small",
+    "8192": "Small",
+    "16384": "Medium",
+    "32768": "Large",
+    "65536": "Very large",
+    "131072": "Extra large"
+};
+
+function formatContextSize(size: number): string {
+    const k = size % 1024 === 0 ? `${size / 1024}k` : String(size);
+    const label = CONTEXT_SIZE_LABELS[String(size)];
+    return label ? `${label} (${k})` : k;
+}
 const DEFAULT_URL = "http://127.0.0.1:11434";
 const ADD_URL_OPTION = "__acp_add_url__";
 
@@ -1295,9 +1310,11 @@ async function configOptions(models: string[] = []): Promise<any[]> {
     log("configOptions:", "current:", currentModel, "fromApi:", JSON.stringify(models), "merged:", JSON.stringify(allModels));
 
     let capabilities: string[] = [];
+    let maxContext: number | undefined;
     try {
         const info = await ollama.getModelCapabilities(currentModel);
         capabilities = info.capabilities;
+        maxContext = typeof info.maxContext === "number" && info.maxContext > 0 ? info.maxContext : undefined;
     } catch {
     }
 
@@ -1315,12 +1332,38 @@ async function configOptions(models: string[] = []): Promise<any[]> {
         });
     }
 
+    let currentContext = ollama.getNumCtx();
+    if (maxContext && currentContext > maxContext) {
+        const was = currentContext;
+        currentContext = maxContext;
+        ollama.setNumCtx(maxContext);
+        log("context clamped to model max:", currentModel, maxContext, "was:", was);
+        saveState({
+            model: currentModel,
+            thinking: ollama.isThinking(),
+            contextSize: currentContext,
+            urls: currentUrls(),
+            activeUrl: currentActiveUrl(),
+            apiKey: ollama.getApiKey()
+        });
+    }
+
     const thinkingDescription = supportsThinking
         ? "Enable reasoning tokens (think mode)."
         : "This model does not support thinking. Reasoning tokens are disabled.";
 
     const urls = currentUrls();
     const activeUrl = currentActiveUrl();
+
+    const contextOptions = CONTEXT_SIZES
+        .filter(s => !maxContext || s <= maxContext)
+        .map(s => ({value: String(s), name: formatContextSize(s)}));
+    if (!contextOptions.some(o => o.value === String(currentContext))) {
+        contextOptions.unshift({value: String(currentContext), name: formatContextSize(currentContext)});
+    }
+    const contextDescription = maxContext
+        ? `Number of context tokens (num_ctx) sent to the model per request. This model supports up to ${formatContextSize(maxContext)}.`
+        : "Number of context tokens (num_ctx) sent to the model per request.";
 
     return [
         {
@@ -1331,7 +1374,7 @@ async function configOptions(models: string[] = []): Promise<any[]> {
             category: "model",
             currentValue: currentModel,
             options: allModels.map(m => ({value: m, name: m})),
-            _meta: {capabilities}
+            _meta: {capabilities, maxContext}
         },
         {
             id: "ollama_url",
@@ -1362,10 +1405,11 @@ async function configOptions(models: string[] = []): Promise<any[]> {
             id: "ollama_context_size",
             type: "select",
             name: "Context Size",
-            description: "Number of context tokens (num_ctx) sent to the model per request.",
+            description: contextDescription,
             category: "context",
-            currentValue: String(ollama.getNumCtx()),
-            options: CONTEXT_SIZES.map(s => ({value: String(s), name: String(s)}))
+            currentValue: String(currentContext),
+            options: contextOptions,
+            _meta: {maxContext}
         }
     ];
 }
