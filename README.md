@@ -9,9 +9,11 @@ It is deliberately **not chat-only**. The agent loop can:
 - run builds, tests, git, grep/rg, package-manager commands through ACP terminals
 - ask IntelliJ for permission before edits/commands
 - stream agent messages, thoughts, and tool-call status into the IDE
+- keep the IDE's thinking shimmer above the input visible while the agent works (progress heartbeat, tunable via `OLLAMA_PROGRESS_HEARTBEAT_MS`)
 - expose **Agent** and **Plan** session modes
 - use a local Ollama model with function/tool calling
 - keep multi-turn session history in-process
+- keep context sized to the selected model: options are labeled by size and auto-clamped to the model's max context
 
 ## Requirements
 
@@ -75,6 +77,8 @@ OLLAMA_MODEL=qwen3-coder
 MAX_AGENT_STEPS=40
 ```
 
+Working shimmer: while a turn is in flight, the agent sends a progress heartbeat on a timer so the IDE keeps its thinking shimmer above the input visible even during long tool calls or silent model thinking. The heartbeat interval in milliseconds can be tuned with `OLLAMA_PROGRESS_HEARTBEAT_MS` (default `4000`, minimum `1000`).
+
 Optional environment variable for remote/authenticated Ollama servers:
 
 ```text
@@ -94,6 +98,17 @@ Autonomous mode. The model is instructed to inspect, edit, run commands, test, a
 ### Plan
 
 Read-only mode. File writes are rejected, and only clearly read-oriented commands are allowed. Use this to make the agent produce an implementation plan before switching to Agent mode.
+
+## Configuration
+
+Live agent settings appear in the IDE's agent configuration panel as ACP config options. Changes apply immediately and persist to `~/.ollama-acp/state.json`:
+
+- **Ollama Model** — choose from the models the current server reports.
+- **Ollama URL** — switch between saved server URLs, or pick "Add new URL..." to type a new one.
+- **Thinking / Reasoning** — enable or disable reasoning tokens. Automatically disabled when the selected model reports no thinking support.
+- **Context Size** — the `num_ctx` sent with each request. Options are labeled by size: `Very small (4k)`, `Small (8k)`, `Medium (16k)`, `Large (32k)`, `Very large (64k)`, `Extra large (128k)`.
+
+The context size stays in sync with the selected model in real time. On every session, model switch, or connection retry, the agent reads the model's maximum context length (`context_length` from Ollama's `/api/show`, reported in `_meta.maxContext`), hides options above that limit, and automatically clamps the active context size down to the model's max — so a small model is never asked to run an oversized context window.
 
 ## Architecture
 
@@ -124,16 +139,13 @@ The important design choice is that the agent does **not** directly manipulate t
 The current project is a strong ACP baseline, not a reimplementation of every JetBrains-native feature. The next high-value additions are:
 
 1. session persistence/load/resume
-2. model selector backed by live Ollama model metadata
-3. ACP config options for model, thinking level, approval policy, and auto-run
-4. structured plans (`plan` session updates)
-5. richer file diffs in `tool_call_update`
-6. cancellation propagation into Ollama HTTP requests
-7. parallel tool calls
-8. context compaction/summarization for long sessions
-9. IntelliJ diagnostics/test/build result ingestion
-10. optional MCP server forwarding from `session/new`
-11. image/vision prompt support for vision-capable Ollama models
-12. background tasks/subagents where supported by the ACP client
+2. ACP config options for approval policy and auto-run
+3. structured plans (`plan` session updates)
+4. richer file diffs in `tool_call_update`
+5. parallel tool calls
+6. IntelliJ diagnostics/test/build result ingestion
+7. optional MCP server forwarding from `session/new`
+8. image/vision prompt support for vision-capable Ollama models
+9. background tasks/subagents where supported by the ACP client
 
 These are additions to the agent; they do not require turning it into an IntelliJ plugin. ACP is specifically intended to let an IDE connect to a coding agent without a bespoke IDE-agent integration.
